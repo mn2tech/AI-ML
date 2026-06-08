@@ -34,12 +34,13 @@ function cosine(a, b) {
 }
 
 function retrieve(query, chunks, vocab, k = 4) {
+  if (!chunks.length) return [];
   const qvec = embed(query, vocab);
-  return chunks
+  const ranked = chunks
     .map((c) => ({ ...c, score: cosine(qvec, c.vec) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, k)
-    .filter((c) => c.score > 0.003);
+    .sort((a, b) => b.score - a.score);
+  const hits = ranked.slice(0, k).filter((c) => c.score > 0.001);
+  return hits.length > 0 ? hits : ranked.slice(0, Math.min(k, ranked.length));
 }
 
 const PIPE_STEPS = ["Query", "Embed", "Retrieve", "Generate", "Done"];
@@ -49,6 +50,44 @@ const QUICK = [
   { label: "💰 Salary info", q: "What salary can AI engineers expect?" },
   { label: "📄 Summarize", q: "Summarize the key points from all documents" },
 ];
+
+const SAMPLE_DOC = {
+  name: "sample-knowledge-base.md",
+  text: `# RAG and AI Engineering Guide
+
+## What is RAG?
+Retrieval-Augmented Generation (RAG) combines document search with large language models. Instead of relying only on the model's training data, RAG retrieves relevant passages from your documents and feeds them as context to the LLM. This produces grounded, up-to-date answers with source citations.
+
+## How RAG Works
+1. **Ingest** — Documents are split into chunks (typically 300-500 tokens).
+2. **Embed** — Each chunk is converted to a vector using TF-IDF or neural embeddings.
+3. **Retrieve** — User queries are embedded and matched to chunks via cosine similarity.
+4. **Generate** — Top-K chunks are sent to Claude/GPT as context for the final answer.
+
+## Top AI Skills in 2026
+- Python and PyTorch/TensorFlow
+- LLM fine-tuning and prompt engineering
+- RAG pipeline design and vector databases (Pinecone, Chroma, FAISS)
+- MLOps: Docker, Kubernetes, CI/CD for models
+- Cloud AI services: AWS Bedrock, Azure OpenAI, GCP Vertex AI
+
+## AI Engineer Salaries (2026)
+- Entry-level AI/ML Engineer: $95,000 – $130,000
+- Mid-level (3-5 yrs): $130,000 – $175,000
+- Senior AI Engineer: $175,000 – $250,000+
+- Staff/Principal: $250,000 – $350,000+ (FAANG/top startups)
+`,
+};
+
+function indexDocument(name, text, existingChunks = [], existingDocs = []) {
+  const cs = chunkText(text).map((t, i) => ({ text: t, source: name, id: `${name}-${i}`, vec: null }));
+  if (cs.length === 0) return null;
+  const newChunks = [...existingChunks, ...cs];
+  const newDocs = [...existingDocs, { name, size: text.length }];
+  const v = buildVocab(newChunks.map((c) => c.text));
+  newChunks.forEach((c) => { if (!c.vec) c.vec = embed(c.text, v); });
+  return { chunks: newChunks, docs: newDocs, vocab: v };
+}
 
 export default function Home() {
   const [docs, setDocs] = useState([]);
@@ -62,6 +101,15 @@ export default function Home() {
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
+  useEffect(() => {
+    const indexed = indexDocument(SAMPLE_DOC.name, SAMPLE_DOC.text);
+    if (indexed) {
+      setChunks(indexed.chunks);
+      setDocs(indexed.docs);
+      setVocab(indexed.vocab);
+    }
+  }, []);
+
   async function handleFiles(files) {
     const newChunks = [...chunks];
     const newDocs = [...docs];
@@ -71,6 +119,7 @@ export default function Home() {
       if (docs.find((d) => d.name === file.name)) continue;
       const text = await file.text();
       const cs = chunkText(text).map((t, i) => ({ text: t, source: file.name, id: `${file.name}-${i}`, vec: null }));
+      if (cs.length === 0) continue;
       newChunks.push(...cs);
       newDocs.push({ name: file.name, size: file.size });
       anyNew = true;
@@ -97,12 +146,20 @@ export default function Home() {
     }
 
     const hits = retrieve(query, chunks, vocab);
+    if (hits.length === 0) {
+      setMessages((m) => [...m, { role: "assistant", text: "No searchable content found. Upload a text-based file (TXT, MD, CSV, etc.) with enough text to chunk.", sources: [] }]);
+      setPipeStep(-1);
+      setLoading(false);
+      return;
+    }
+
+    const payload = hits.map(({ text, source }) => ({ text, source }));
 
     try {
       const res = await fetch("/api/rag", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, chunks: hits }),
+        body: JSON.stringify({ query, chunks: payload }),
       });
       const data = await res.json();
       setPipeStep(4);
@@ -115,7 +172,7 @@ export default function Home() {
     setLoading(false);
   }
 
-  const ready = docs.length > 0;
+  const ready = chunks.length > 0;
 
   return (
     <>
