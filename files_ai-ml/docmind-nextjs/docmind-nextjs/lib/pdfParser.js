@@ -1,8 +1,8 @@
-// Server-side PDF text extraction using pdf-parse
+// Server-side PDF text extraction — pdf-parse v1 (Node-safe, no DOMMatrix)
 
 export async function extractPdfText(buffer) {
-  // Dynamic import avoids bundling issues on serverless
-  const pdfParse = (await import("pdf-parse")).default;
+  // Use require to keep pdf-parse out of the client bundle (CJS, server-only)
+  const pdfParse = require("pdf-parse");
   const data = await pdfParse(buffer);
   return data.text?.trim() || "";
 }
