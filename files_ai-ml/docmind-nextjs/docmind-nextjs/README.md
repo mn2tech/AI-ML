@@ -1,36 +1,41 @@
 # 🧠 DocMind RAG — Next.js + Vercel
 
-A production-ready RAG document Q&A app. Deploy to Vercel in 5 minutes.
+A production-ready RAG document Q&A app with PDF support, OpenAI embeddings, streaming responses, and chat memory.
 
-## 🚀 Deploy to Vercel (Free, 5 minutes)
+## ✨ Features
 
-### Option A — One-click via Vercel CLI
-```bash
-npm install -g vercel
-npm install
-vercel deploy
-```
+- **PDF upload** — Server-side text extraction via `pdf-parse`
+- **Real embeddings** — OpenAI `text-embedding-3-small` with TF-IDF fallback
+- **Streaming** — Token-by-token Claude responses via SSE
+- **Chat memory** — Last 6 messages sent as conversation context
+- **Smart chunking** — Paragraph-aware, ~500 tokens with 100-token overlap
+- **UI** — Dark/light mode, mobile responsive, relevance scores, copy button
 
-### Option B — GitHub + Vercel Dashboard
-1. Push this folder to GitHub
-2. Go to **https://vercel.com/new**
-3. Import your GitHub repo
-4. Add environment variable:
-   - Name: `ANTHROPIC_API_KEY`
-   - Value: `sk-ant-your-key-here`
-5. Click **Deploy!**
+---
 
-Your app will be live at:
-`https://docmind-rag-YOUR_USERNAME.vercel.app`
+## 🚀 Deploy to Vercel
+
+1. Push to GitHub
+2. Import at **https://vercel.com/new**
+3. Set **Root Directory** to `files_ai-ml/docmind-nextjs/docmind-nextjs`
+4. Add environment variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | ✅ Yes | Claude API key for Q&A |
+| `OPENAI_API_KEY` | Optional | Enables real embeddings (falls back to TF-IDF) |
+
+5. Click **Deploy**
 
 ---
 
 ## 🏃 Run Locally
 
 ```bash
+cd files_ai-ml/docmind-nextjs/docmind-nextjs
 npm install
-# Create .env.local file:
-echo "ANTHROPIC_API_KEY=sk-ant-your-key-here" > .env.local
+cp .env.local.example .env.local
+# Edit .env.local with your keys
 npm run dev
 # Open http://localhost:3000
 ```
@@ -38,41 +43,54 @@ npm run dev
 ---
 
 ## 📁 Project Structure
+
 ```
-docmind-rag/
+docmind-nextjs/
 ├── pages/
-│   ├── index.js       # Main UI (React)
+│   ├── index.js          # Main UI (React)
 │   └── api/
-│       └── rag.js     # Claude API route (server-side)
-├── package.json
+│       ├── rag.js        # Claude streaming + chat history
+│       ├── embed.js      # OpenAI embeddings (TF-IDF fallback)
+│       └── parse.js      # PDF text extraction
+├── lib/
+│   ├── chunker.js        # Smart paragraph chunking
+│   ├── vectorStore.js    # Cosine similarity + TF-IDF
+│   └── pdfParser.js      # pdf-parse wrapper
+├── .env.local.example
+├── next.config.js
 └── README.md
 ```
+
+---
 
 ## 🧠 Architecture
 
 ```
-Browser (React)          Server (Next.js API)       Claude API
-─────────────────        ───────────────────        ──────────
-User uploads docs   →   
-TF-IDF vectorize    →   
-Cosine similarity   →   
-Top-K chunks        →   POST /api/rag         →    claude-sonnet
-                    ←   Answer + sources      ←    Grounded response
-Display in chat     ←
+Browser (React)              Server (Next.js API)           External APIs
+─────────────────            ────────────────────           ─────────────
+Upload PDF          →        POST /api/parse        →       pdf-parse
+Chunk documents     →        POST /api/embed        →       OpenAI embeddings
+Cosine retrieve     ←        (or TF-IDF fallback)
+Stream chat         ↔        POST /api/rag (SSE)    →       Claude Sonnet
 ```
 
-## 🔧 Tech Stack
-- **Frontend**: Next.js 14 + React 18
-- **Backend**: Next.js API Routes (serverless)
-- **LLM**: Claude Sonnet (Anthropic API)
-- **Embeddings**: TF-IDF (client-side, no external API needed)
-- **Vector Search**: Cosine similarity (NumPy-style in JS)
-- **Hosting**: Vercel (free tier)
+---
 
-## 💼 What this demonstrates for employers
-- RAG architecture end-to-end
-- Serverless API design
-- React state management
-- LLM prompt engineering
+## 🔧 Tech Stack
+
+- **Frontend**: Next.js 14 + React 18
+- **LLM**: Claude Sonnet (Anthropic API, streaming)
+- **Embeddings**: OpenAI text-embedding-3-small (TF-IDF fallback)
+- **PDF**: pdf-parse (server-side)
+- **Vector Search**: Cosine similarity
+- **Hosting**: Vercel (serverless)
+
+---
+
+## 💼 Portfolio Highlights
+
+- End-to-end RAG pipeline with real embeddings
+- Serverless streaming API design
+- Graceful fallbacks (TF-IDF when OpenAI unavailable)
+- PDF ingestion, chat memory, responsive UI
 - Production deployment on Vercel
-- Clean, well-structured codebase

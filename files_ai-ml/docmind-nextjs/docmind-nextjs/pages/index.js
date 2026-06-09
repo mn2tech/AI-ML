@@ -1,47 +1,39 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Head from "next/head";
+import { buildChunks } from "../lib/chunker";
+import { retrieve } from "../lib/vectorStore";
 
-// ── RAG helpers (client-side) ─────────────────────────────────────────────
-function chunkText(text, size = 400, overlap = 80) {
-  const words = text.split(/\s+/);
-  const out = [];
-  for (let i = 0; i < words.length; i += size - overlap) {
-    const c = words.slice(i, i + size).join(" ");
-    if (c.trim().length > 20) out.push(c);
-  }
-  return out;
-}
-
-function buildVocab(chunks) {
-  const all = chunks.join(" ");
-  const words = [...new Set(all.toLowerCase().split(/\W+/).filter((w) => w.length > 2))];
-  return words.slice(0, 1000);
-}
-
-function embed(text, vocab) {
-  const words = text.toLowerCase().split(/\W+/).filter(Boolean);
-  const tf = {};
-  words.forEach((w) => (tf[w] = (tf[w] || 0) + 1));
-  const vec = vocab.map((w) => (tf[w] || 0) / words.length);
-  const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
-  return norm > 0 ? vec.map((v) => v / norm) : vec;
-}
-
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9);
-}
-
-function retrieve(query, chunks, vocab, k = 4) {
-  if (!chunks.length) return [];
-  const qvec = embed(query, vocab);
-  const ranked = chunks
-    .map((c) => ({ ...c, score: cosine(qvec, c.vec) }))
-    .sort((a, b) => b.score - a.score);
-  const hits = ranked.slice(0, k).filter((c) => c.score > 0.001);
-  return hits.length > 0 ? hits : ranked.slice(0, Math.min(k, ranked.length));
-}
+// ── Theme tokens ────────────────────────────────────────────────────────────
+const THEMES = {
+  dark: {
+    bg: "#0d0d14",
+    surface: "#16161f",
+    surface2: "#1e1e2a",
+    text: "#eeebff",
+    muted: "#8883aa",
+    dim: "#4a4768",
+    accent: "#7c6ef7",
+    accentLight: "#a594f9",
+    border: "rgba(255,255,255,0.07)",
+    border2: "rgba(255,255,255,0.13)",
+    userBg: "rgba(124,110,247,0.14)",
+    success: "#4ade80",
+  },
+  light: {
+    bg: "#f0eff8",
+    surface: "#ffffff",
+    surface2: "#f5f4ff",
+    text: "#1a1833",
+    muted: "#5c5878",
+    dim: "#9896b0",
+    accent: "#7c6ef7",
+    accentLight: "#6b5ce7",
+    border: "rgba(0,0,0,0.08)",
+    border2: "rgba(0,0,0,0.12)",
+    userBg: "rgba(124,110,247,0.12)",
+    success: "#16a34a",
+  },
+};
 
 const PIPE_STEPS = ["Query", "Embed", "Retrieve", "Generate", "Done"];
 const QUICK = [
@@ -53,6 +45,7 @@ const QUICK = [
 
 const SAMPLE_DOC = {
   name: "sample-knowledge-base.md",
+  type: "md",
   text: `# RAG and AI Engineering Guide
 
 ## What is RAG?
@@ -79,177 +72,388 @@ Retrieval-Augmented Generation (RAG) combines document search with large languag
 `,
 };
 
-function indexDocument(name, text, existingChunks = [], existingDocs = []) {
-  const cs = chunkText(text).map((t, i) => ({ text: t, source: name, id: `${name}-${i}`, vec: null }));
-  if (cs.length === 0) return null;
-  const newChunks = [...existingChunks, ...cs];
-  const newDocs = [...existingDocs, { name, size: text.length }];
-  const v = buildVocab(newChunks.map((c) => c.text));
-  newChunks.forEach((c) => { if (!c.vec) c.vec = embed(c.text, v); });
-  return { chunks: newChunks, docs: newDocs, vocab: v };
+function fileIcon(name) {
+  if (name.toLowerCase().endsWith(".pdf")) return "📕";
+  if (name.toLowerCase().endsWith(".csv")) return "📊";
+  if (name.toLowerCase().endsWith(".md")) return "📝";
+  return "📄";
+}
+
+function fileType(name) {
+  const ext = name.split(".").pop()?.toLowerCase();
+  return ext || "txt";
+}
+
+function formatMarkdown(text) {
+  if (!text) return "";
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br>");
 }
 
 export default function Home() {
+  const [theme, setTheme] = useState("dark");
   const [docs, setDocs] = useState([]);
   const [chunks, setChunks] = useState([]);
   const [vocab, setVocab] = useState([]);
+  const [embedMethod, setEmbedMethod] = useState("tfidf");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [streaming, setStreaming] = useState(false);
   const [pipeStep, setPipeStep] = useState(-1);
+  const [uploading, setUploading] = useState(false);
+  const [retrievedChunks, setRetrievedChunks] = useState([]);
+  const [copiedIdx, setCopiedIdx] = useState(null);
   const bottomRef = useRef(null);
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  const t = THEMES[theme];
 
   useEffect(() => {
-    const indexed = indexDocument(SAMPLE_DOC.name, SAMPLE_DOC.text);
-    if (indexed) {
-      setChunks(indexed.chunks);
-      setDocs(indexed.docs);
-      setVocab(indexed.vocab);
-    }
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, streaming]);
+
+  // Load theme preference
+  useEffect(() => {
+    const saved = localStorage.getItem("docmind-theme");
+    if (saved === "light" || saved === "dark") setTheme(saved);
   }, []);
 
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    localStorage.setItem("docmind-theme", next);
+  };
+
+  /** Call /api/embed to vectorize texts */
+  const embedTexts = useCallback(async (texts) => {
+    const res = await fetch("/api/embed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Embedding failed");
+    return data;
+  }, []);
+
+  /** Index a document: chunk → embed → update state */
+  const indexDocument = useCallback(async (name, text, type, size, existingChunks, existingDocs) => {
+    const newChunkObjs = buildChunks(text, name);
+    if (!newChunkObjs.length) return null;
+
+    let allChunks = [...existingChunks, ...newChunkObjs];
+    const textsToEmbed =
+      embedMethod === "openai" && existingChunks.length > 0
+        ? newChunkObjs.map((c) => c.text)
+        : allChunks.map((c) => c.text);
+
+    const { embeddings, vocab: newVocab, method } = await embedTexts(textsToEmbed);
+
+    if (method === "openai") {
+      newChunkObjs.forEach((c, i) => { c.vec = embeddings[i]; });
+      allChunks = [...existingChunks, ...newChunkObjs];
+    } else {
+      allChunks = allChunks.map((c, i) => ({ ...c, vec: embeddings[i] }));
+      if (newVocab) setVocab(newVocab);
+    }
+
+    setEmbedMethod(method);
+    const newDocs = [...existingDocs, { name, size, type, chunkCount: newChunkObjs.length }];
+
+    return { chunks: allChunks, docs: newDocs };
+  }, [embedTexts, embedMethod]);
+
+  // Load sample doc on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await indexDocument(
+          SAMPLE_DOC.name, SAMPLE_DOC.text, SAMPLE_DOC.type,
+          SAMPLE_DOC.text.length, [], []
+        );
+        if (result) {
+          setChunks(result.chunks);
+          setDocs(result.docs);
+        }
+      } catch (e) {
+        console.error("Sample doc load failed:", e);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Extract text from file — PDF goes through /api/parse */
+  async function extractFileText(file) {
+    if (file.name.toLowerCase().endsWith(".pdf")) {
+      const res = await fetch("/api/parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/pdf", "X-Filename": file.name },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "PDF parse failed");
+      return data.text;
+    }
+    return file.text();
+  }
+
   async function handleFiles(files) {
-    const newChunks = [...chunks];
-    const newDocs = [...docs];
-    let anyNew = false;
+    setUploading(true);
+    let currentChunks = [...chunks];
+    let currentDocs = [...docs];
 
-    for (const file of files) {
-      if (docs.find((d) => d.name === file.name)) continue;
-      const text = await file.text();
-      const cs = chunkText(text).map((t, i) => ({ text: t, source: file.name, id: `${file.name}-${i}`, vec: null }));
-      if (cs.length === 0) continue;
-      newChunks.push(...cs);
-      newDocs.push({ name: file.name, size: file.size });
-      anyNew = true;
-    }
+    try {
+      for (const file of files) {
+        if (currentDocs.find((d) => d.name === file.name)) continue;
 
-    if (anyNew) {
-      const v = buildVocab(newChunks.map((c) => c.text));
-      newChunks.forEach((c) => { if (!c.vec) c.vec = embed(c.text, v); });
-      setVocab(v);
-      setChunks(newChunks);
-      setDocs(newDocs);
+        const text = await extractFileText(file);
+        const result = await indexDocument(
+          file.name, text, fileType(file.name), file.size,
+          currentChunks, currentDocs
+        );
+        if (result) {
+          currentChunks = result.chunks;
+          currentDocs = result.docs;
+        }
+      }
+      setChunks(currentChunks);
+      setDocs(currentDocs);
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", text: `Upload error: ${e.message}`, sources: [] }]);
     }
+    setUploading(false);
   }
 
   async function sendQuery(query) {
     if (!query.trim() || loading) return;
     setInput("");
     setLoading(true);
+    setRetrievedChunks([]);
     setMessages((m) => [...m, { role: "user", text: query }]);
 
-    for (let i = 0; i <= 3; i++) {
-      setPipeStep(i);
-      await new Promise((r) => setTimeout(r, 280));
-    }
-
-    const hits = retrieve(query, chunks, vocab);
-    if (hits.length === 0) {
-      setMessages((m) => [...m, { role: "assistant", text: "No searchable content found. Upload a text-based file (TXT, MD, CSV, etc.) with enough text to chunk.", sources: [] }]);
-      setPipeStep(-1);
-      setLoading(false);
-      return;
-    }
-
-    const payload = hits.map(({ text, source }) => ({ text, source }));
-
     try {
+      // Step 1: Embed query
+      setPipeStep(0);
+      const { embeddings } = await embedTexts([query]);
+      const queryVec = embeddings[0];
+
+      setPipeStep(1);
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Step 2: Retrieve
+      setPipeStep(2);
+      const hits = retrieve(queryVec, chunks, 4);
+      setRetrievedChunks(hits);
+
+      if (!hits.length) {
+        setMessages((m) => [...m, { role: "assistant", text: "No searchable content found. Upload documents with enough text to chunk.", sources: [] }]);
+        setPipeStep(-1);
+        setLoading(false);
+        return;
+      }
+
+      setPipeStep(3);
+
+      // Build history from last 6 messages (exclude current user msg we just added)
+      const history = messages.slice(-6).map((m) => ({ role: m.role, text: m.text }));
+
+      const payload = hits.map(({ text, source, scorePct, id }) => ({ text, source, scorePct, id }));
+
+      // Step 3: Stream from Claude
       const res = await fetch("/api/rag", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, chunks: payload }),
+        body: JSON.stringify({ query, chunks: payload, history, stream: true }),
       });
-      const data = await res.json();
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "RAG request failed");
+      }
+
+      // Add placeholder assistant message for streaming
+      setMessages((m) => [...m, { role: "assistant", text: "", sources: [], streaming: true }]);
+      setStreaming(true);
+      setLoading(false);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let fullText = "";
+      let sources = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === "sources") {
+              sources = evt.sources;
+            } else if (evt.type === "token") {
+              fullText += evt.text;
+              setMessages((m) => {
+                const copy = [...m];
+                copy[copy.length - 1] = { role: "assistant", text: fullText, sources, streaming: true };
+                return copy;
+              });
+            } else if (evt.type === "error") {
+              throw new Error(evt.error);
+            }
+          } catch (parseErr) {
+            if (parseErr.message !== "Unexpected end of JSON input") throw parseErr;
+          }
+        }
+      }
+
+      setMessages((m) => {
+        const copy = [...m];
+        copy[copy.length - 1] = { role: "assistant", text: fullText, sources, streaming: false };
+        return copy;
+      });
+      setStreaming(false);
       setPipeStep(4);
-      setMessages((m) => [...m, { role: "assistant", text: data.answer || data.error, sources: data.sources || [] }]);
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", text: "Error: " + e.message, sources: [] }]);
+      setStreaming(false);
     }
 
     setTimeout(() => setPipeStep(-1), 2000);
     setLoading(false);
   }
 
+  function clearChat() {
+    setMessages([]);
+    setRetrievedChunks([]);
+  }
+
+  function copyMessage(text, idx) {
+    navigator.clipboard.writeText(text.replace(/<[^>]+>/g, ""));
+    setCopiedIdx(idx);
+    setTimeout(() => setCopiedIdx(null), 2000);
+  }
+
   const ready = chunks.length > 0;
+  const embedLabel = embedMethod === "openai" ? "OpenAI Embeddings" : "TF-IDF";
 
   return (
     <>
       <Head>
         <title>DocMind RAG</title>
         <meta name="description" content="RAG-powered document Q&A — portfolio AI project" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
       </Head>
 
-      <div style={{ minHeight: "100vh", background: "#0d0d14", color: "#eeebff", fontFamily: "'DM Mono', monospace", padding: "20px" }}>
+      <div className="app-root" style={{ minHeight: "100vh", background: t.bg, color: t.text, fontFamily: "'DM Mono', monospace", padding: "16px" }}>
         {/* Header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, paddingBottom: 16, borderBottom: "0.5px solid rgba(255,255,255,0.08)" }}>
+        <div className="header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, paddingBottom: 14, borderBottom: `0.5px solid ${t.border}`, flexWrap: "wrap", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{ width: 36, height: 36, borderRadius: 10, background: "rgba(124,110,247,0.14)", border: "1px solid #7c6ef7", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🧠</div>
+            <div style={{ width: 36, height: 36, borderRadius: 10, background: "rgba(124,110,247,0.14)", border: `1px solid ${t.accent}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🧠</div>
             <div>
               <div style={{ fontFamily: "Syne, sans-serif", fontSize: 18, fontWeight: 700 }}>DocMind RAG</div>
-              <div style={{ fontSize: 10, color: "#4a4768", textTransform: "uppercase", letterSpacing: "0.08em" }}>Retrieval-Augmented Generation</div>
+              <div style={{ fontSize: 10, color: t.dim, textTransform: "uppercase", letterSpacing: "0.08em" }}>Retrieval-Augmented Generation</div>
             </div>
           </div>
-          <div style={{ fontSize: 10, padding: "4px 12px", borderRadius: 20, background: "rgba(74,222,128,0.1)", color: "#4ade80", border: "0.5px solid rgba(74,222,128,0.3)", display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ width: 5, height: 5, borderRadius: "50%", background: "#4ade80", display: "inline-block" }}></span>
-            Claude API · Live
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={toggleTheme} title="Toggle theme"
+              style={{ background: t.surface2, border: `0.5px solid ${t.border2}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 14, color: t.text }}>
+              {theme === "dark" ? "☀️" : "🌙"}
+            </button>
+            <div style={{ fontSize: 10, padding: "4px 12px", borderRadius: 20, background: "rgba(74,222,128,0.1)", color: t.success, border: `0.5px solid rgba(74,222,128,0.3)`, display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 5, height: 5, borderRadius: "50%", background: t.success, display: "inline-block" }}></span>
+              Claude · {embedLabel}
+            </div>
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 16 }}>
+        <div className="layout-grid" style={{ display: "grid", gridTemplateColumns: "240px 1fr", gap: 16 }}>
           {/* Sidebar */}
           <aside>
-            <div style={{ background: "#16161f", border: "0.5px solid rgba(255,255,255,0.07)", borderRadius: 12, overflow: "hidden" }}>
-              <div style={{ padding: "10px 14px", borderBottom: "0.5px solid rgba(255,255,255,0.07)", fontSize: 10, color: "#4a4768", textTransform: "uppercase", letterSpacing: "0.1em" }}>📁 Knowledge Base</div>
+            <div style={{ background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "10px 14px", borderBottom: `0.5px solid ${t.border}`, fontSize: 10, color: t.dim, textTransform: "uppercase", letterSpacing: "0.1em" }}>📁 Knowledge Base</div>
 
-              {/* Upload zone */}
-              <label style={{ display: "block", margin: 10, border: "1px dashed rgba(255,255,255,0.13)", borderRadius: 8, padding: "16px 10px", textAlign: "center", cursor: "pointer", transition: "all 0.2s" }}
+              <label style={{ display: "block", margin: 10, border: `1px dashed ${t.border2}`, borderRadius: 8, padding: "16px 10px", textAlign: "center", cursor: uploading ? "wait" : "pointer", opacity: uploading ? 0.6 : 1 }}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => { e.preventDefault(); handleFiles(Array.from(e.dataTransfer.files)); }}>
-                <div style={{ fontSize: 22, marginBottom: 6 }}>☁️</div>
-                <div style={{ fontSize: 11, color: "#8883aa" }}>Drop files or <span style={{ color: "#a594f9" }}>browse</span></div>
-                <div style={{ fontSize: 10, color: "#4a4768", marginTop: 3 }}>TXT · MD · CSV · PY · JS</div>
-                <input type="file" multiple accept=".txt,.md,.csv,.py,.js,.html,.json" style={{ display: "none" }}
+                <div style={{ fontSize: 22, marginBottom: 6 }}>{uploading ? "⏳" : "☁️"}</div>
+                <div style={{ fontSize: 11, color: t.muted }}>{uploading ? "Processing…" : <>Drop files or <span style={{ color: t.accentLight }}>browse</span></>}</div>
+                <div style={{ fontSize: 10, color: t.dim, marginTop: 3 }}>TXT · MD · CSV · PDF · PY · JS</div>
+                <input type="file" multiple accept=".txt,.md,.csv,.pdf,.py,.js,.html,.json" style={{ display: "none" }}
+                  disabled={uploading}
                   onChange={(e) => handleFiles(Array.from(e.target.files))} />
               </label>
 
-              {/* Doc list */}
+              {/* Doc list with chunk counts */}
               {docs.length > 0 && (
                 <div style={{ padding: "0 8px 8px" }}>
                   {docs.map((d) => (
-                    <div key={d.name} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px", borderRadius: 6, background: "#1e1e2a", border: "0.5px solid #7c6ef7", marginBottom: 3 }}>
-                      <span style={{ fontSize: 12 }}>📄</span>
-                      <span style={{ fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}</span>
+                    <div key={d.name} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px", borderRadius: 6, background: t.surface2, border: `0.5px solid ${t.accent}`, marginBottom: 3 }}>
+                      <span style={{ fontSize: 12 }}>{fileIcon(d.name)}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}</div>
+                        <div style={{ fontSize: 9, color: t.dim }}>{d.chunkCount ?? "?"} chunks</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Retrieved chunks highlight */}
+              {retrievedChunks.length > 0 && (
+                <div style={{ padding: "8px", borderTop: `0.5px solid ${t.border}` }}>
+                  <div style={{ fontSize: 9, color: t.dim, textTransform: "uppercase", marginBottom: 6, letterSpacing: "0.08em" }}>Last Retrieved</div>
+                  {retrievedChunks.map((c) => (
+                    <div key={c.id} style={{ fontSize: 9, padding: "4px 6px", marginBottom: 3, borderRadius: 4, background: t.surface2, border: `0.5px solid ${t.border}` }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                        <span style={{ color: t.accentLight }}>{c.source}</span>
+                        <span style={{ color: t.success }}>{c.scorePct}%</span>
+                      </div>
+                      <div style={{ height: 3, borderRadius: 2, background: t.border, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${c.scorePct}%`, background: t.accent, borderRadius: 2 }} />
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
 
               {/* Stats */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, padding: "8px 8px", borderTop: "0.5px solid rgba(255,255,255,0.07)" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, padding: "8px 8px", borderTop: `0.5px solid ${t.border}` }}>
                 {[["Docs", docs.length], ["Chunks", chunks.length]].map(([label, val]) => (
-                  <div key={label} style={{ background: "#1e1e2a", borderRadius: 6, padding: "7px 8px", textAlign: "center" }}>
-                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: 18, fontWeight: 700, color: "#a594f9" }}>{val}</div>
-                    <div style={{ fontSize: 9, color: "#4a4768", textTransform: "uppercase" }}>{label}</div>
+                  <div key={label} style={{ background: t.surface2, borderRadius: 6, padding: "7px 8px", textAlign: "center" }}>
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: 18, fontWeight: 700, color: t.accentLight }}>{val}</div>
+                    <div style={{ fontSize: 9, color: t.dim, textTransform: "uppercase" }}>{label}</div>
                   </div>
                 ))}
               </div>
 
-              {/* Tech tags */}
-              <div style={{ padding: "8px 12px", borderTop: "0.5px solid rgba(255,255,255,0.07)", display: "flex", flexWrap: "wrap", gap: 3 }}>
-                {["TF-IDF", "Cosine Sim", "Top-K", "Claude API"].map((t) => (
-                  <span key={t} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 20, background: "#1e1e2a", color: "#8883aa", border: "0.5px solid rgba(255,255,255,0.07)" }}>{t}</span>
+              <div style={{ padding: "8px 12px", borderTop: `0.5px solid ${t.border}`, display: "flex", flexWrap: "wrap", gap: 3 }}>
+                {[embedLabel, "Cosine Sim", "Top-K", "Streaming", "Claude API"].map((tag) => (
+                  <span key={tag} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 20, background: t.surface2, color: t.muted, border: `0.5px solid ${t.border}` }}>{tag}</span>
                 ))}
               </div>
             </div>
           </aside>
 
           {/* Chat */}
-          <div style={{ background: "#16161f", border: "0.5px solid rgba(255,255,255,0.07)", borderRadius: 12, display: "flex", flexDirection: "column", height: "calc(100vh - 120px)" }}>
-            <div style={{ padding: "10px 14px", borderBottom: "0.5px solid rgba(255,255,255,0.07)", fontSize: 10, color: "#4a4768", textTransform: "uppercase", letterSpacing: "0.1em" }}>💬 Q&A Chat</div>
+          <div style={{ background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 12, display: "flex", flexDirection: "column", height: "calc(100vh - 110px)", minHeight: 400 }}>
+            <div style={{ padding: "10px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 10, color: t.dim, textTransform: "uppercase", letterSpacing: "0.1em" }}>💬 Q&A Chat</span>
+              {messages.length > 0 && (
+                <button onClick={clearChat}
+                  style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: "transparent", border: `0.5px solid ${t.border2}`, color: t.muted, cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>
+                  Clear chat
+                </button>
+              )}
+            </div>
 
             {/* Messages */}
             <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
@@ -257,34 +461,52 @@ export default function Home() {
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 10, textAlign: "center" }}>
                   <div style={{ fontSize: 40 }}>🧠</div>
                   <div style={{ fontFamily: "Syne, sans-serif", fontSize: 15, fontWeight: 700 }}>{ready ? "Ready to answer!" : "Upload docs to begin"}</div>
-                  <div style={{ fontSize: 12, color: "#8883aa", maxWidth: 260, lineHeight: 1.6 }}>
-                    {ready ? "Click a quick button or type your question below." : "Add documents in the sidebar, then ask questions."}
+                  <div style={{ fontSize: 12, color: t.muted, maxWidth: 280, lineHeight: 1.6 }}>
+                    {ready ? "Ask questions about your documents. Supports PDF, streaming, and follow-up context." : "Add documents in the sidebar, then ask questions."}
                   </div>
                 </div>
               )}
               {messages.map((m, i) => (
                 <div key={i} style={{ display: "flex", gap: 8, flexDirection: m.role === "user" ? "row-reverse" : "row" }}>
-                  <div style={{ width: 26, height: 26, borderRadius: 7, background: m.role === "assistant" ? "rgba(124,110,247,0.14)" : "#1e1e2a", border: `0.5px solid ${m.role === "assistant" ? "#7c6ef7" : "rgba(255,255,255,0.13)"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0 }}>
+                  <div style={{ width: 26, height: 26, borderRadius: 7, background: m.role === "assistant" ? "rgba(124,110,247,0.14)" : t.surface2, border: `0.5px solid ${m.role === "assistant" ? t.accent : t.border2}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0 }}>
                     {m.role === "assistant" ? "🧠" : "👤"}
                   </div>
-                  <div style={{ maxWidth: "80%" }}>
-                    <div style={{ padding: "9px 13px", fontSize: 13, lineHeight: 1.65, borderRadius: m.role === "assistant" ? "3px 10px 10px 10px" : "10px 3px 10px 10px", background: m.role === "assistant" ? "#1e1e2a" : "rgba(124,110,247,0.14)", border: `0.5px solid ${m.role === "assistant" ? "rgba(255,255,255,0.07)" : "rgba(124,110,247,0.25)"}` }}
-                      dangerouslySetInnerHTML={{ __html: m.text?.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/\n/g, "<br>") }} />
+                  <div style={{ maxWidth: "85%", position: "relative" }}>
+                    <div style={{ padding: "9px 13px", fontSize: 13, lineHeight: 1.65, borderRadius: m.role === "assistant" ? "3px 10px 10px 10px" : "10px 3px 10px 10px", background: m.role === "assistant" ? t.surface2 : t.userBg, border: `0.5px solid ${m.role === "assistant" ? t.border : "rgba(124,110,247,0.25)"}` }}>
+                      <span dangerouslySetInnerHTML={{ __html: formatMarkdown(m.text) }} />
+                      {m.streaming && <span className="stream-cursor" style={{ color: t.accent }}>▍</span>}
+                    </div>
+                    {m.role === "assistant" && m.text && !m.streaming && (
+                      <button onClick={() => copyMessage(m.text, i)} title="Copy"
+                        style={{ position: "absolute", top: 4, right: 4, background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 4, padding: "2px 6px", fontSize: 9, cursor: "pointer", color: t.muted, fontFamily: "'DM Mono', monospace" }}>
+                        {copiedIdx === i ? "✓ Copied" : "Copy"}
+                      </button>
+                    )}
                     {m.sources?.length > 0 && (
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 5 }}>
-                        {[...new Set(m.sources)].map((s) => (
-                          <span key={s} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 20, background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "0.5px solid rgba(251,191,36,0.25)" }}>📄 {s}</span>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                        {m.sources.map((s, si) => (
+                          <div key={si} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 20, background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "0.5px solid rgba(251,191,36,0.25)", whiteSpace: "nowrap" }}>
+                              {fileIcon(s.source)} {s.source}
+                              {s.scorePct != null && ` · ${s.scorePct}%`}
+                            </span>
+                            {s.scorePct != null && (
+                              <div style={{ flex: 1, maxWidth: 80, height: 4, borderRadius: 2, background: t.border, overflow: "hidden" }}>
+                                <div style={{ height: "100%", width: `${s.scorePct}%`, background: "#fbbf24", borderRadius: 2 }} />
+                              </div>
+                            )}
+                          </div>
                         ))}
                       </div>
                     )}
                   </div>
                 </div>
               ))}
-              {loading && (
+              {loading && !streaming && (
                 <div style={{ display: "flex", gap: 8 }}>
-                  <div style={{ width: 26, height: 26, borderRadius: 7, background: "rgba(124,110,247,0.14)", border: "0.5px solid #7c6ef7", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>🧠</div>
-                  <div style={{ padding: "9px 13px", background: "#1e1e2a", borderRadius: "3px 10px 10px 10px", border: "0.5px solid rgba(255,255,255,0.07)", display: "flex", gap: 4, alignItems: "center" }}>
-                    {[0, 1, 2].map((i) => <span key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: "#a594f9", display: "inline-block", animation: `blink 1.2s ${i * 0.2}s infinite` }}></span>)}
+                  <div style={{ width: 26, height: 26, borderRadius: 7, background: "rgba(124,110,247,0.14)", border: `0.5px solid ${t.accent}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>🧠</div>
+                  <div style={{ padding: "9px 13px", background: t.surface2, borderRadius: "3px 10px 10px 10px", border: `0.5px solid ${t.border}`, display: "flex", gap: 4, alignItems: "center" }}>
+                    {[0, 1, 2].map((i) => <span key={i} className="dot-blink" style={{ width: 6, height: 6, borderRadius: "50%", background: t.accentLight, display: "inline-block", animationDelay: `${i * 0.2}s` }}></span>)}
                   </div>
                 </div>
               )}
@@ -293,11 +515,11 @@ export default function Home() {
 
             {/* Pipeline */}
             {pipeStep >= 0 && (
-              <div style={{ padding: "8px 14px", borderTop: "0.5px solid rgba(255,255,255,0.07)", display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+              <div style={{ padding: "8px 14px", borderTop: `0.5px solid ${t.border}`, display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
                 {PIPE_STEPS.map((s, i) => (
                   <span key={s}>
-                    <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, textTransform: "uppercase", letterSpacing: "0.05em", color: i < pipeStep ? "#4ade80" : i === pipeStep ? "#a594f9" : "#4a4768", background: i === pipeStep ? "rgba(124,110,247,0.14)" : "transparent" }}>{s}</span>
-                    {i < PIPE_STEPS.length - 1 && <span style={{ color: "#4a4768", fontSize: 9 }}> › </span>}
+                    <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 4, textTransform: "uppercase", letterSpacing: "0.05em", color: i < pipeStep ? t.success : i === pipeStep ? t.accentLight : t.dim, background: i === pipeStep ? "rgba(124,110,247,0.14)" : "transparent" }}>{s}</span>
+                    {i < PIPE_STEPS.length - 1 && <span style={{ color: t.dim, fontSize: 9 }}> › </span>}
                   </span>
                 ))}
               </div>
@@ -305,10 +527,10 @@ export default function Home() {
 
             {/* Quick prompts */}
             {ready && (
-              <div style={{ padding: "8px 10px", borderTop: "0.5px solid rgba(255,255,255,0.07)", display: "flex", flexWrap: "wrap", gap: 5 }}>
+              <div style={{ padding: "8px 10px", borderTop: `0.5px solid ${t.border}`, display: "flex", flexWrap: "wrap", gap: 5 }}>
                 {QUICK.map(({ label, q }) => (
-                  <button key={label} onClick={() => sendQuery(q)} disabled={loading}
-                    style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "5px 11px", borderRadius: 20, background: "#1e1e2a", border: "0.5px solid #7c6ef7", color: "#a594f9", cursor: "pointer", transition: "all 0.15s" }}>
+                  <button key={label} onClick={() => sendQuery(q)} disabled={loading || streaming}
+                    style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "5px 11px", borderRadius: 20, background: t.surface2, border: `0.5px solid ${t.accent}`, color: t.accentLight, cursor: "pointer" }}>
                     {label}
                   </button>
                 ))}
@@ -316,14 +538,14 @@ export default function Home() {
             )}
 
             {/* Input */}
-            <div style={{ padding: 10, borderTop: "0.5px solid rgba(255,255,255,0.07)", display: "flex", gap: 8 }}>
+            <div style={{ padding: 10, borderTop: `0.5px solid ${t.border}`, display: "flex", gap: 8 }}>
               <input value={input} onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") sendQuery(input); }}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) sendQuery(input); }}
                 placeholder={ready ? "Ask anything about your documents…" : "Upload documents first…"}
-                disabled={!ready || loading}
-                style={{ flex: 1, background: "#1e1e2a", border: "0.5px solid rgba(255,255,255,0.13)", borderRadius: 8, padding: "9px 12px", fontFamily: "'DM Mono', monospace", fontSize: 13, color: "#eeebff", outline: "none" }} />
-              <button onClick={() => sendQuery(input)} disabled={!ready || loading || !input.trim()}
-                style={{ width: 38, height: 38, borderRadius: 8, background: "#7c6ef7", border: "none", cursor: "pointer", fontSize: 16, color: "white", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>→</button>
+                disabled={!ready || loading || streaming}
+                style={{ flex: 1, background: t.surface2, border: `0.5px solid ${t.border2}`, borderRadius: 8, padding: "9px 12px", fontFamily: "'DM Mono', monospace", fontSize: 13, color: t.text, outline: "none" }} />
+              <button onClick={() => sendQuery(input)} disabled={!ready || loading || streaming || !input.trim()}
+                style={{ width: 38, height: 38, borderRadius: 8, background: t.accent, border: "none", cursor: "pointer", fontSize: 16, color: "white", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: (!ready || loading || streaming || !input.trim()) ? 0.5 : 1 }}>→</button>
             </div>
           </div>
         </div>
@@ -333,8 +555,15 @@ export default function Home() {
         * { box-sizing: border-box; }
         body { margin: 0; }
         @keyframes blink { 0%,80%,100%{opacity:0.2;transform:scale(0.8)} 40%{opacity:1;transform:scale(1)} }
+        @keyframes cursor-blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        .stream-cursor { animation: cursor-blink 0.8s step-end infinite; margin-left: 1px; }
+        .dot-blink { animation: blink 1.2s infinite; }
         ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.3); border-radius: 4px; }
+        @media (max-width: 768px) {
+          .layout-grid { grid-template-columns: 1fr !important; }
+          .header { flex-direction: column; align-items: flex-start !important; }
+        }
       `}</style>
     </>
   );
