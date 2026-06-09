@@ -125,12 +125,12 @@ export default function Home() {
     localStorage.setItem("docmind-theme", next);
   };
 
-  /** Call /api/embed to vectorize texts */
-  const embedTexts = useCallback(async (texts) => {
+  /** Call /api/embed to vectorize texts (pass sharedVocab for TF-IDF query embedding) */
+  const embedTexts = useCallback(async (texts, sharedVocab = null) => {
     const res = await fetch("/api/embed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ texts }),
+      body: JSON.stringify({ texts, vocab: sharedVocab }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Embedding failed");
@@ -142,27 +142,20 @@ export default function Home() {
     const newChunkObjs = buildChunks(text, name);
     if (!newChunkObjs.length) return null;
 
-    let allChunks = [...existingChunks, ...newChunkObjs];
-    const textsToEmbed =
-      embedMethod === "openai" && existingChunks.length > 0
-        ? newChunkObjs.map((c) => c.text)
-        : allChunks.map((c) => c.text);
+    const allChunks = [...existingChunks, ...newChunkObjs];
+    // Always re-embed all chunks so vectors share the same space (vocab or OpenAI dims)
+    const textsToEmbed = allChunks.map((c) => c.text);
+    const sharedVocab = embedMethod === "tfidf" ? vocab : null;
+    const { embeddings, vocab: newVocab, method } = await embedTexts(textsToEmbed, sharedVocab);
 
-    const { embeddings, vocab: newVocab, method } = await embedTexts(textsToEmbed);
-
-    if (method === "openai") {
-      newChunkObjs.forEach((c, i) => { c.vec = embeddings[i]; });
-      allChunks = [...existingChunks, ...newChunkObjs];
-    } else {
-      allChunks = allChunks.map((c, i) => ({ ...c, vec: embeddings[i] }));
-      if (newVocab) setVocab(newVocab);
-    }
+    const embeddedChunks = allChunks.map((c, i) => ({ ...c, vec: embeddings[i] }));
+    if (method === "tfidf" && newVocab) setVocab(newVocab);
 
     setEmbedMethod(method);
     const newDocs = [...existingDocs, { name, size, type, chunkCount: newChunkObjs.length }];
 
-    return { chunks: allChunks, docs: newDocs };
-  }, [embedTexts, embedMethod]);
+    return { chunks: embeddedChunks, docs: newDocs };
+  }, [embedTexts, embedMethod, vocab]);
 
   // Load sample doc on mount
   useEffect(() => {
@@ -233,9 +226,10 @@ export default function Home() {
     setMessages((m) => [...m, { role: "user", text: query }]);
 
     try {
-      // Step 1: Embed query
+      // Step 1: Embed query (must use same vocab as chunks for TF-IDF)
       setPipeStep(0);
-      const { embeddings } = await embedTexts([query]);
+      const queryVocab = embedMethod === "tfidf" && vocab.length ? vocab : null;
+      const { embeddings } = await embedTexts([query], queryVocab);
       const queryVec = embeddings[0];
 
       setPipeStep(1);

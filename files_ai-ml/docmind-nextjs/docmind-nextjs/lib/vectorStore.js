@@ -20,8 +20,8 @@ export function tfidfEmbed(text, vocab) {
 }
 
 /** Embed multiple texts with TF-IDF (fallback when OpenAI unavailable) */
-export function tfidfEmbedBatch(texts) {
-  const vocab = buildVocab(texts);
+export function tfidfEmbedBatch(texts, existingVocab = null) {
+  const vocab = existingVocab?.length ? existingVocab : buildVocab(texts);
   return {
     embeddings: texts.map((t) => tfidfEmbed(t, vocab)),
     vocab,
@@ -59,7 +59,7 @@ export function retrieve(queryVec, chunks, k = 4) {
   const result = hits.length > 0 ? hits : ranked.slice(0, Math.min(k, ranked.length));
 
   // Normalize scores to 0–100% relative to top hit for display
-  const maxScore = result[0]?.score || 1;
+  const maxScore = Math.max(result[0]?.score ?? 0, 1e-9);
   return result.map((c) => ({
     ...c,
     scorePct: Math.round((c.score / maxScore) * 100),

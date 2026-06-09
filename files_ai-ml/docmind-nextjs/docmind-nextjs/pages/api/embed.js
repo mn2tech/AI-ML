@@ -8,7 +8,7 @@ const openai = process.env.OPENAI_API_KEY
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { texts } = req.body;
+  const { texts, vocab: sharedVocab } = req.body;
   if (!texts?.length) {
     return res.status(400).json({ error: "Missing texts array" });
   }
@@ -28,15 +28,15 @@ export default async function handler(req, res) {
       return res.json({ embeddings, method: "openai", dimensions: embeddings[0]?.length || 1536 });
     }
 
-    // Fallback: client-side-compatible TF-IDF vectors
-    const { embeddings, vocab, method } = tfidfEmbedBatch(texts);
+    // Fallback: TF-IDF vectors (reuse shared vocab for query embedding)
+    const { embeddings, vocab, method } = tfidfEmbedBatch(texts, sharedVocab);
     return res.json({ embeddings, vocab, method, dimensions: embeddings[0]?.length || 0 });
   } catch (err) {
     console.error("Embed error:", err);
 
     // Graceful fallback if OpenAI fails mid-request
     try {
-      const { embeddings, vocab, method } = tfidfEmbedBatch(texts);
+      const { embeddings, vocab, method } = tfidfEmbedBatch(texts, sharedVocab);
       return res.json({ embeddings, vocab, method, dimensions: embeddings[0]?.length || 0, fallback: true });
     } catch {
       res.status(500).json({ error: err.message });
