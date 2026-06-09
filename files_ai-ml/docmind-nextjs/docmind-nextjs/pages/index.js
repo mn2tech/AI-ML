@@ -84,6 +84,22 @@ function fileType(name) {
   return ext || "txt";
 }
 
+/** File picker accept string matching a doc's type */
+function acceptForDoc(doc) {
+  const type = doc.type || fileType(doc.name);
+  const map = {
+    pdf: ".pdf",
+    md: ".md,.markdown,.txt",
+    csv: ".csv",
+    txt: ".txt,.md",
+    py: ".py",
+    js: ".js,.jsx,.ts,.tsx",
+    html: ".html,.htm",
+    json: ".json",
+  };
+  return map[type] || `.${type}`;
+}
+
 function formatMarkdown(text) {
   if (!text) return "";
   return text
@@ -105,7 +121,11 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [retrievedChunks, setRetrievedChunks] = useState([]);
   const [copiedIdx, setCopiedIdx] = useState(null);
+  const [deletingDocs, setDeletingDocs] = useState(new Set());
+  const [docBusy, setDocBusy] = useState(false);
   const bottomRef = useRef(null);
+  const replaceInputRef = useRef(null);
+  const replacingDocRef = useRef(null);
 
   const t = THEMES[theme];
 
@@ -156,6 +176,29 @@ export default function Home() {
 
     return { chunks: embeddedChunks, docs: newDocs };
   }, [embedTexts, embedMethod, vocab]);
+
+  /** Re-embed all chunks after delete/replace (rebuilds TF-IDF vocab from scratch) */
+  const reembedAll = useCallback(async (newDocs, rawChunks) => {
+    if (!rawChunks.length) {
+      setDocs([]);
+      setChunks([]);
+      setVocab([]);
+      return;
+    }
+    const textsToEmbed = rawChunks.map((c) => c.text);
+    const { embeddings, vocab: newVocab, method } = await embedTexts(textsToEmbed, null);
+    const embedded = rawChunks.map((c, i) => ({ ...c, vec: embeddings[i] }));
+    if (method === "tfidf" && newVocab) setVocab(newVocab);
+    setEmbedMethod(method);
+    setChunks(embedded);
+    setDocs(newDocs);
+  }, [embedTexts]);
+
+  /** Reset chat + retrieved chunks (used after doc changes) */
+  function resetChatWithNotice(notice) {
+    setRetrievedChunks([]);
+    setMessages(notice ? [{ role: "assistant", text: notice, sources: [] }] : []);
+  }
 
   // Load sample doc on mount
   useEffect(() => {
@@ -216,6 +259,102 @@ export default function Home() {
       setMessages((m) => [...m, { role: "assistant", text: `Upload error: ${e.message}`, sources: [] }]);
     }
     setUploading(false);
+  }
+
+  /** Remove a document and rebuild vectors */
+  async function deleteDocument(docName) {
+    if (docBusy || deletingDocs.has(docName)) return;
+    setDocBusy(true);
+    setDeletingDocs((prev) => new Set([...prev, docName]));
+
+    const newDocs = docs.filter((d) => d.name !== docName);
+    const newChunks = chunks.filter((c) => c.source !== docName);
+
+    setTimeout(async () => {
+      try {
+        await reembedAll(newDocs, newChunks);
+        resetChatWithNotice(`Removed: ${docName}`);
+      } catch (e) {
+        setMessages((m) => [...m, { role: "assistant", text: `Delete error: ${e.message}`, sources: [] }]);
+      } finally {
+        setDeletingDocs((prev) => {
+          const next = new Set(prev);
+          next.delete(docName);
+          return next;
+        });
+        setDocBusy(false);
+      }
+    }, 300);
+  }
+
+  /** Open file picker to replace a document in-place */
+  function triggerReplace(doc) {
+    if (docBusy || uploading) return;
+    replacingDocRef.current = doc;
+    const input = replaceInputRef.current;
+    if (!input) return;
+    input.accept = acceptForDoc(doc);
+    input.value = "";
+    input.click();
+  }
+
+  /** Handle file selected for replace */
+  async function handleReplaceFile(e) {
+    const file = e.target.files?.[0];
+    const targetDoc = replacingDocRef.current;
+    replacingDocRef.current = null;
+    if (!file || !targetDoc) return;
+
+    setDocBusy(true);
+    setUploading(true);
+
+    try {
+      const docIndex = docs.findIndex((d) => d.name === targetDoc.name);
+      if (docIndex === -1) return;
+
+      const text = await extractFileText(file);
+      const newChunkObjs = buildChunks(text, file.name);
+      if (!newChunkObjs.length) throw new Error("No searchable content in replacement file.");
+
+      const remainingDocs = docs.filter((d) => d.name !== targetDoc.name);
+      const newDoc = { name: file.name, size: file.size, type: fileType(file.name), chunkCount: newChunkObjs.length };
+      const newDocs = [...remainingDocs.slice(0, docIndex), newDoc, ...remainingDocs.slice(docIndex)];
+
+      // Preserve chunk order by doc position in list
+      const orderedChunks = [];
+      for (const d of newDocs) {
+        if (d.name === file.name) {
+          orderedChunks.push(...newChunkObjs);
+        } else {
+          orderedChunks.push(...chunks.filter((c) => c.source === d.name));
+        }
+      }
+
+      await reembedAll(newDocs, orderedChunks);
+      resetChatWithNotice(`Replaced: ${targetDoc.name} → ${file.name}`);
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", text: `Replace error: ${e.message}`, sources: [] }]);
+    }
+
+    setUploading(false);
+    setDocBusy(false);
+  }
+
+  /** Clear all documents and chat */
+  async function clearAllDocuments() {
+    if (docBusy || uploading) return;
+    setDocBusy(true);
+    setDeletingDocs(new Set(docs.map((d) => d.name)));
+
+    setTimeout(async () => {
+      setDocs([]);
+      setChunks([]);
+      setVocab([]);
+      setRetrievedChunks([]);
+      setMessages([]);
+      setDeletingDocs(new Set());
+      setDocBusy(false);
+    }, 300);
   }
 
   async function sendQuery(query) {
@@ -386,18 +525,52 @@ export default function Home() {
                   onChange={(e) => handleFiles(Array.from(e.target.files))} />
               </label>
 
-              {/* Doc list with chunk counts */}
+              {/* Doc list with chunk counts + management */}
               {docs.length > 0 && (
                 <div style={{ padding: "0 8px 8px" }}>
                   {docs.map((d) => (
-                    <div key={d.name} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px", borderRadius: 6, background: t.surface2, border: `0.5px solid ${t.accent}`, marginBottom: 3 }}>
-                      <span style={{ fontSize: 12 }}>{fileIcon(d.name)}</span>
+                    <div
+                      key={d.name}
+                      className={`doc-item${deletingDocs.has(d.name) ? " doc-item-deleting" : ""}`}
+                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px", borderRadius: 6, background: t.surface2, border: `0.5px solid ${t.accent}`, marginBottom: 3 }}
+                    >
+                      <span style={{ fontSize: 12, flexShrink: 0 }}>{fileIcon(d.name)}</span>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}</div>
                         <div style={{ fontSize: 9, color: t.dim }}>{d.chunkCount ?? "?"} chunks</div>
                       </div>
+                      <div className="doc-actions" style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                        <button
+                          type="button"
+                          title="Replace"
+                          disabled={docBusy || uploading}
+                          onClick={() => triggerReplace(d)}
+                          style={{ width: 22, height: 22, borderRadius: 5, background: "rgba(124,110,247,0.2)", border: "0.5px solid #7c6ef7", color: t.accentLight, cursor: docBusy || uploading ? "not-allowed" : "pointer", fontSize: 11, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, fontFamily: "'DM Mono', monospace", opacity: docBusy || uploading ? 0.4 : 1 }}
+                        >↺</button>
+                        <button
+                          type="button"
+                          title="Delete"
+                          disabled={docBusy || uploading}
+                          onClick={() => deleteDocument(d.name)}
+                          style={{ width: 22, height: 22, borderRadius: 5, background: "rgba(248,113,113,0.2)", border: "0.5px solid #f87171", color: "#f87171", cursor: docBusy || uploading ? "not-allowed" : "pointer", fontSize: 11, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, fontFamily: "'DM Mono', monospace", opacity: docBusy || uploading ? 0.4 : 1 }}
+                        >✕</button>
+                      </div>
                     </div>
                   ))}
+                  <button
+                    type="button"
+                    onClick={clearAllDocuments}
+                    disabled={docBusy || uploading}
+                    style={{ width: "100%", marginTop: 6, padding: "6px 10px", borderRadius: 6, background: "transparent", border: `0.5px solid ${t.border2}`, color: t.muted, cursor: docBusy || uploading ? "not-allowed" : "pointer", fontSize: 10, fontFamily: "'DM Mono', monospace", opacity: docBusy || uploading ? 0.4 : 1 }}
+                  >
+                    Clear all
+                  </button>
+                  <input
+                    ref={replaceInputRef}
+                    type="file"
+                    style={{ display: "none" }}
+                    onChange={handleReplaceFile}
+                  />
                 </div>
               )}
 
@@ -550,8 +723,14 @@ export default function Home() {
         body { margin: 0; }
         @keyframes blink { 0%,80%,100%{opacity:0.2;transform:scale(0.8)} 40%{opacity:1;transform:scale(1)} }
         @keyframes cursor-blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes doc-fade-out { to { opacity: 0; transform: translateX(-8px); max-height: 0; margin: 0; padding: 0; } }
         .stream-cursor { animation: cursor-blink 0.8s step-end infinite; margin-left: 1px; }
         .dot-blink { animation: blink 1.2s infinite; }
+        .doc-item { transition: opacity 0.3s ease, transform 0.3s ease; }
+        .doc-item-deleting { animation: doc-fade-out 0.3s ease forwards; pointer-events: none; }
+        .doc-item .doc-actions { opacity: 0; transition: opacity 0.15s ease; }
+        .doc-item:hover .doc-actions { opacity: 1; }
+        @media (hover: none) { .doc-item .doc-actions { opacity: 1; } }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.3); border-radius: 4px; }
         @media (max-width: 768px) {
