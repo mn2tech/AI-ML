@@ -36,6 +36,7 @@ const THEMES = {
 };
 
 const PIPE_STEPS = ["Query", "Embed", "Retrieve", "Generate", "Done"];
+const PASTE_DOC_MIN_CHARS = 300;
 const QUICK = [
   { label: "💡 What is RAG?", q: "What is RAG and how does it work?" },
   { label: "🔥 Top AI skills", q: "What AI skills are most in demand for jobs in 2026?" },
@@ -73,6 +74,7 @@ Retrieval-Augmented Generation (RAG) combines document search with large languag
 };
 
 function fileIcon(name) {
+  if (name.startsWith("pasted-text-")) return "📋";
   if (name.toLowerCase().endsWith(".pdf")) return "📕";
   if (name.toLowerCase().endsWith(".csv")) return "📊";
   if (name.toLowerCase().endsWith(".md")) return "📝";
@@ -123,7 +125,9 @@ export default function Home() {
   const [copiedIdx, setCopiedIdx] = useState(null);
   const [deletingDocs, setDeletingDocs] = useState(new Set());
   const [docBusy, setDocBusy] = useState(false);
+  const [visitCount, setVisitCount] = useState(null);
   const bottomRef = useRef(null);
+  const inputRef = useRef(null);
   const replaceInputRef = useRef(null);
   const replacingDocRef = useRef(null);
 
@@ -133,10 +137,37 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streaming]);
 
+  // Auto-resize chat textarea
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
+
   // Load theme preference
   useEffect(() => {
     const saved = localStorage.getItem("docmind-theme");
     if (saved === "light" || saved === "dark") setTheme(saved);
+  }, []);
+
+  // Track visits — count once per browser per day, show total in header
+  useEffect(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    const visitKey = `docmind-visit-${today}`;
+    const alreadyCounted = localStorage.getItem(visitKey);
+
+    fetch("/api/visit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ increment: !alreadyCounted }),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.count != null) setVisitCount(data.count);
+        if (!alreadyCounted) localStorage.setItem(visitKey, "1");
+      })
+      .catch(() => {});
   }, []);
 
   const toggleTheme = () => {
@@ -232,6 +263,54 @@ export default function Home() {
       return data.text;
     }
     return file.text();
+  }
+
+  /** Index pasted or typed text as a virtual document */
+  async function pasteAsDocument(text) {
+    const trimmed = text.trim();
+    if (!trimmed || uploading || docBusy) return false;
+
+    const name = `pasted-text-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    setUploading(true);
+
+    try {
+      const result = await indexDocument(name, trimmed, "txt", trimmed.length, [...chunks], [...docs]);
+
+      if (!result) {
+        setMessages((m) => [...m, { role: "assistant", text: "Could not chunk pasted text — try a longer passage.", sources: [] }]);
+        return false;
+      }
+
+      setChunks(result.chunks);
+      setDocs(result.docs);
+      const chunkCount = result.docs.find((d) => d.name === name)?.chunkCount ?? "?";
+      setMessages((m) => [...m, {
+        role: "assistant",
+        text: `Added pasted text (${chunkCount} chunk${chunkCount === 1 ? "" : "s"}). Ask a question below.`,
+        sources: [],
+      }]);
+      setInput("");
+      return true;
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", text: `Paste error: ${e.message}`, sources: [] }]);
+      return false;
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  /** Auto-index long pasted text (Option A) */
+  function handleInputPaste(e) {
+    const text = e.clipboardData?.getData("text/plain");
+    if (!text || text.trim().length < PASTE_DOC_MIN_CHARS) return;
+
+    e.preventDefault();
+    pasteAsDocument(text);
+  }
+
+  async function handlePasteAsDocClick() {
+    if (!input.trim()) return;
+    await pasteAsDocument(input);
   }
 
   async function handleFiles(files) {
@@ -359,6 +438,16 @@ export default function Home() {
 
   async function sendQuery(query) {
     if (!query.trim() || loading) return;
+
+    if (!chunks.length) {
+      setMessages((m) => [...m,
+        { role: "user", text: query.trim() },
+        { role: "assistant", text: "No documents yet. Paste text here (300+ chars auto-adds) or upload files in the sidebar.", sources: [] },
+      ]);
+      setInput("");
+      return;
+    }
+
     setInput("");
     setLoading(true);
     setRetrievedChunks([]);
@@ -496,7 +585,12 @@ export default function Home() {
               <div style={{ fontSize: 10, color: t.dim, textTransform: "uppercase", letterSpacing: "0.08em" }}>Retrieval-Augmented Generation</div>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {visitCount != null && visitCount > 0 && (
+              <div style={{ fontSize: 10, padding: "4px 12px", borderRadius: 20, background: "rgba(124,110,247,0.1)", color: t.accentLight, border: `0.5px solid rgba(124,110,247,0.3)`, display: "flex", alignItems: "center", gap: 5 }}>
+                👥 {visitCount.toLocaleString()} {visitCount === 1 ? "person has" : "people have"} tried DocMind
+              </div>
+            )}
             <button onClick={toggleTheme} title="Toggle theme"
               style={{ background: t.surface2, border: `0.5px solid ${t.border2}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 14, color: t.text }}>
               {theme === "dark" ? "☀️" : "🌙"}
@@ -629,7 +723,9 @@ export default function Home() {
                   <div style={{ fontSize: 40 }}>🧠</div>
                   <div style={{ fontFamily: "Syne, sans-serif", fontSize: 15, fontWeight: 700 }}>{ready ? "Ready to answer!" : "Upload docs to begin"}</div>
                   <div style={{ fontSize: 12, color: t.muted, maxWidth: 280, lineHeight: 1.6 }}>
-                    {ready ? "Ask questions about your documents. Supports PDF, streaming, and follow-up context." : "Add documents in the sidebar, then ask questions."}
+                    {ready
+                      ? "Paste text, upload files, or ask questions. Long paste auto-adds as a document."
+                      : "Paste text here or upload files in the sidebar to begin."}
                   </div>
                 </div>
               )}
@@ -704,15 +800,83 @@ export default function Home() {
               </div>
             )}
 
-            {/* Input */}
-            <div style={{ padding: 10, borderTop: `0.5px solid ${t.border}`, display: "flex", gap: 8 }}>
-              <input value={input} onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) sendQuery(input); }}
-                placeholder={ready ? "Ask anything about your documents…" : "Upload documents first…"}
-                disabled={!ready || loading || streaming}
-                style={{ flex: 1, background: t.surface2, border: `0.5px solid ${t.border2}`, borderRadius: 8, padding: "9px 12px", fontFamily: "'DM Mono', monospace", fontSize: 13, color: t.text, outline: "none" }} />
-              <button onClick={() => sendQuery(input)} disabled={!ready || loading || streaming || !input.trim()}
-                style={{ width: 38, height: 38, borderRadius: 8, background: t.accent, border: "none", cursor: "pointer", fontSize: 16, color: "white", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: (!ready || loading || streaming || !input.trim()) ? 0.5 : 1 }}>→</button>
+            {/* Input — multiline textarea (Option B) + paste-as-doc (Option A) */}
+            <div style={{ padding: 10, borderTop: `0.5px solid ${t.border}` }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onPaste={handleInputPaste}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendQuery(input);
+                    }
+                  }}
+                  placeholder="Paste text or ask a question… (Shift+Enter for new line)"
+                  disabled={loading || streaming || uploading}
+                  rows={1}
+                  style={{
+                    flex: 1,
+                    background: t.surface2,
+                    border: `0.5px solid ${t.border2}`,
+                    borderRadius: 8,
+                    padding: "9px 12px",
+                    fontFamily: "'DM Mono', monospace",
+                    fontSize: 13,
+                    color: t.text,
+                    outline: "none",
+                    resize: "none",
+                    minHeight: 38,
+                    maxHeight: 160,
+                    lineHeight: 1.5,
+                  }}
+                />
+                <button
+                  onClick={() => sendQuery(input)}
+                  disabled={loading || streaming || uploading || !input.trim()}
+                  title="Send"
+                  style={{
+                    width: 38,
+                    height: 38,
+                    borderRadius: 8,
+                    background: t.accent,
+                    border: "none",
+                    cursor: "pointer",
+                    fontSize: 16,
+                    color: "white",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    opacity: (loading || streaming || uploading || !input.trim()) ? 0.5 : 1,
+                  }}
+                >→</button>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 9, color: t.dim }}>
+                  Enter to send · Shift+Enter new line · Paste 300+ chars to auto-add
+                </span>
+                <button
+                  type="button"
+                  onClick={handlePasteAsDocClick}
+                  disabled={loading || streaming || uploading || input.trim().length < 50}
+                  style={{
+                    fontFamily: "'DM Mono', monospace",
+                    fontSize: 10,
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    background: "rgba(124,110,247,0.2)",
+                    border: "0.5px solid #7c6ef7",
+                    color: t.accentLight,
+                    cursor: (loading || streaming || uploading || input.trim().length < 50) ? "not-allowed" : "pointer",
+                    opacity: (loading || streaming || uploading || input.trim().length < 50) ? 0.5 : 1,
+                  }}
+                >
+                  📋 Paste as doc
+                </button>
+              </div>
             </div>
           </div>
         </div>

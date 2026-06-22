@@ -10,6 +10,8 @@ A production-ready RAG document Q&A app with PDF support, OpenAI embeddings, str
 - **Chat memory** — Last 6 messages sent as conversation context
 - **Smart chunking** — Paragraph-aware, ~500 tokens with 100-token overlap
 - **UI** — Dark/light mode, mobile responsive, relevance scores, copy button
+- **Visit counter** — Public "people have tried DocMind" badge (Upstash Redis)
+- **Analytics** — Vercel Analytics for private traffic insights
 
 ---
 
@@ -24,8 +26,14 @@ A production-ready RAG document Q&A app with PDF support, OpenAI embeddings, str
 |----------|----------|-------------|
 | `ANTHROPIC_API_KEY` | ✅ Yes | Claude API key for Q&A |
 | `OPENAI_API_KEY` | Optional | Enables real embeddings (falls back to TF-IDF) |
+| `KV_REST_API_URL` | Optional | Upstash Redis URL (visit counter) |
+| `KV_REST_API_TOKEN` | Optional | Upstash Redis token (visit counter) |
 
-5. Click **Deploy**
+5. **Enable visit counter** (optional): Vercel Dashboard → your project → **Storage** → add **Upstash Redis** integration. Env vars are injected automatically.
+
+6. **Enable analytics** (optional): Vercel Dashboard → your project → **Analytics** → Enable.
+
+7. Click **Deploy**
 
 ---
 
@@ -51,7 +59,9 @@ docmind-nextjs/
 │   └── api/
 │       ├── rag.js        # Claude streaming + chat history
 │       ├── embed.js      # OpenAI embeddings (TF-IDF fallback)
-│       └── parse.js      # PDF text extraction
+│       ├── parse.js      # PDF text extraction
+│       └── visit.js      # Visit counter (Upstash Redis)
+├── pages/_app.js         # Vercel Analytics
 ├── lib/
 │   ├── chunker.js        # Smart paragraph chunking
 │   ├── vectorStore.js    # Cosine similarity + TF-IDF
