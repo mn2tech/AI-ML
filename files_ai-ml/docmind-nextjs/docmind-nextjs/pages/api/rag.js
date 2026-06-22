@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 
 const SYSTEM_PROMPT =
   "You are a RAG-powered document Q&A assistant. Answer using ONLY the provided document context. Be concise (2-5 sentences). Use **bold** for key terms. If the context doesn't contain the answer, say so clearly. When the user asks follow-up questions, use conversation history for context but still ground answers in the documents.";
@@ -61,7 +62,7 @@ export default async function handler(req, res) {
       res.write(`data: ${JSON.stringify({ type: "sources", sources: sourceDetails })}\n\n`);
 
       const anthropicStream = await client.messages.stream({
-        model: "claude-sonnet-4-20250514",
+        model: MODEL,
         max_tokens: 1000,
         system: SYSTEM_PROMPT,
         messages: cleaned,
@@ -80,7 +81,7 @@ export default async function handler(req, res) {
       res.end();
     } else {
       const response = await client.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: MODEL,
         max_tokens: 1000,
         system: SYSTEM_PROMPT,
         messages: cleaned,
