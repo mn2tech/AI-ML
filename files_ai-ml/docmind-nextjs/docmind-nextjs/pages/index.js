@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import Head from "next/head";
+import { useRouter } from "next/router";
 import { buildChunks } from "../lib/chunker";
 import { retrieve } from "../lib/vectorStore";
 
@@ -75,6 +76,7 @@ Retrieval-Augmented Generation (RAG) combines document search with large languag
 
 function fileIcon(name) {
   if (name.startsWith("pasted-text-")) return "📋";
+  if (name.startsWith("gdrive-")) return "📁";
   if (name.toLowerCase().endsWith(".pdf")) return "📕";
   if (name.toLowerCase().endsWith(".csv")) return "📊";
   if (name.toLowerCase().endsWith(".md")) return "📝";
@@ -126,7 +128,14 @@ export default function Home() {
   const [deletingDocs, setDeletingDocs] = useState(new Set());
   const [docBusy, setDocBusy] = useState(false);
   const [visitCount, setVisitCount] = useState(null);
+  const [driveConnected, setDriveConnected] = useState(false);
+  const [driveConfigured, setDriveConfigured] = useState(true);
+  const [driveModal, setDriveModal] = useState(false);
+  const [driveFiles, setDriveFiles] = useState([]);
+  const [driveLoading, setDriveLoading] = useState(false);
+  const [driveImporting, setDriveImporting] = useState(null);
   const bottomRef = useRef(null);
+  const router = useRouter();
   const inputRef = useRef(null);
   const replaceInputRef = useRef(null);
   const replacingDocRef = useRef(null);
@@ -169,6 +178,36 @@ export default function Home() {
       })
       .catch(() => {});
   }, []);
+
+  // Check Google Drive connection status
+  const checkDriveStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/auth/google/status");
+      const data = await res.json();
+      setDriveConnected(Boolean(data.connected));
+      setDriveConfigured(data.configured !== false);
+    } catch {
+      setDriveConnected(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkDriveStatus();
+  }, [checkDriveStatus]);
+
+  // Handle OAuth redirect query params
+  useEffect(() => {
+    if (!router.isReady) return;
+    const { drive, reason } = router.query;
+    if (drive === "connected") {
+      setDriveConnected(true);
+      setMessages((m) => [...m, { role: "assistant", text: "Google Drive connected. Click **Import from Drive** to add files.", sources: [] }]);
+      router.replace("/", undefined, { shallow: true });
+    } else if (drive === "error") {
+      setMessages((m) => [...m, { role: "assistant", text: `Google Drive connection failed${reason ? `: ${reason}` : ""}.`, sources: [] }]);
+      router.replace("/", undefined, { shallow: true });
+    }
+  }, [router.isReady, router.query]);
 
   const toggleTheme = () => {
     const next = theme === "dark" ? "light" : "dark";
@@ -311,6 +350,69 @@ export default function Home() {
   async function handlePasteAsDocClick() {
     if (!input.trim()) return;
     await pasteAsDocument(input);
+  }
+
+  function connectGoogleDrive() {
+    window.location.href = "/api/auth/google";
+  }
+
+  async function disconnectGoogleDrive() {
+    await fetch("/api/auth/google/disconnect", { method: "POST" });
+    setDriveConnected(false);
+    setDriveModal(false);
+    setMessages((m) => [...m, { role: "assistant", text: "Google Drive disconnected.", sources: [] }]);
+  }
+
+  async function openDriveModal() {
+    setDriveModal(true);
+    setDriveLoading(true);
+    setDriveFiles([]);
+    try {
+      const res = await fetch("/api/drive/list");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to list files");
+      setDriveFiles(data.files || []);
+    } catch (e) {
+      setDriveModal(false);
+      setMessages((m) => [...m, { role: "assistant", text: `Drive error: ${e.message}`, sources: [] }]);
+    }
+    setDriveLoading(false);
+  }
+
+  async function importDriveFile(file) {
+    if (uploading || docBusy || driveImporting) return;
+    if (docs.find((d) => d.name === `gdrive-${file.name}`)) {
+      setMessages((m) => [...m, { role: "assistant", text: `Already imported: ${file.name}`, sources: [] }]);
+      return;
+    }
+
+    setDriveImporting(file.id);
+    setUploading(true);
+
+    try {
+      const res = await fetch("/api/drive/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileId: file.id, name: file.name, mimeType: file.mimeType }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Import failed");
+
+      const docName = `gdrive-${data.name}`;
+      const result = await indexDocument(docName, data.text, data.type, data.size, [...chunks], [...docs]);
+      if (result) {
+        setChunks(result.chunks);
+        setDocs(result.docs);
+        const chunkCount = result.docs.find((d) => d.name === docName)?.chunkCount ?? "?";
+        setMessages((m) => [...m, { role: "assistant", text: `Imported from Drive: **${data.name}** (${chunkCount} chunks)`, sources: [] }]);
+        setDriveModal(false);
+      }
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", text: `Drive import error: ${e.message}`, sources: [] }]);
+    }
+
+    setDriveImporting(null);
+    setUploading(false);
   }
 
   async function handleFiles(files) {
@@ -619,6 +721,63 @@ export default function Home() {
                   onChange={(e) => handleFiles(Array.from(e.target.files))} />
               </label>
 
+              {/* Google Drive */}
+              {driveConfigured && (
+                <div style={{ padding: "0 10px 10px", borderBottom: docs.length > 0 ? `0.5px solid ${t.border}` : "none" }}>
+                  {!driveConnected ? (
+                    <button
+                      type="button"
+                      onClick={connectGoogleDrive}
+                      disabled={uploading || docBusy}
+                      style={{
+                        width: "100%",
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        background: "rgba(66,133,244,0.12)",
+                        border: "0.5px solid rgba(66,133,244,0.4)",
+                        color: "#8ab4f8",
+                        cursor: "pointer",
+                        fontSize: 11,
+                        fontFamily: "'DM Mono', monospace",
+                      }}
+                    >
+                      📁 Connect Google Drive
+                    </button>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 9, color: t.success }}>
+                        <span>● Drive connected</span>
+                        <button
+                          type="button"
+                          onClick={disconnectGoogleDrive}
+                          style={{ background: "none", border: "none", color: t.muted, cursor: "pointer", fontSize: 9, fontFamily: "'DM Mono', monospace" }}
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={openDriveModal}
+                        disabled={uploading || docBusy || driveLoading}
+                        style={{
+                          width: "100%",
+                          padding: "8px 10px",
+                          borderRadius: 8,
+                          background: "rgba(66,133,244,0.12)",
+                          border: "0.5px solid rgba(66,133,244,0.4)",
+                          color: "#8ab4f8",
+                          cursor: "pointer",
+                          fontSize: 11,
+                          fontFamily: "'DM Mono', monospace",
+                        }}
+                      >
+                        {driveLoading ? "Loading…" : "📂 Import from Drive"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Doc list with chunk counts + management */}
               {docs.length > 0 && (
                 <div style={{ padding: "0 8px 8px" }}>
@@ -880,6 +1039,69 @@ export default function Home() {
             </div>
           </div>
         </div>
+
+        {/* Google Drive file picker modal */}
+        {driveModal && (
+          <div
+            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 }}
+            onClick={() => !driveImporting && setDriveModal(false)}
+          >
+            <div
+              style={{ background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 12, width: "100%", maxWidth: 420, maxHeight: "70vh", display: "flex", flexDirection: "column" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={{ padding: "12px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "Syne, sans-serif" }}>Import from Google Drive</span>
+                <button
+                  type="button"
+                  onClick={() => setDriveModal(false)}
+                  style={{ background: "none", border: "none", color: t.muted, cursor: "pointer", fontSize: 16 }}
+                >✕</button>
+              </div>
+              <div style={{ flex: 1, overflowY: "auto", padding: 8 }}>
+                {driveLoading ? (
+                  <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>Loading files…</div>
+                ) : driveFiles.length === 0 ? (
+                  <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>No importable files found.</div>
+                ) : (
+                  driveFiles.map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      disabled={Boolean(driveImporting)}
+                      onClick={() => importDriveFile(f)}
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "8px 10px",
+                        marginBottom: 4,
+                        borderRadius: 8,
+                        background: driveImporting === f.id ? "rgba(124,110,247,0.2)" : t.surface2,
+                        border: `0.5px solid ${t.border}`,
+                        cursor: driveImporting ? "wait" : "pointer",
+                        textAlign: "left",
+                        fontFamily: "'DM Mono', monospace",
+                        color: t.text,
+                      }}
+                    >
+                      <span style={{ fontSize: 14 }}>
+                        {f.mimeType === "application/pdf" ? "📕" : f.mimeType?.includes("spreadsheet") ? "📊" : f.mimeType?.includes("document") ? "📝" : "📄"}
+                      </span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                        <div style={{ fontSize: 9, color: t.dim }}>
+                          {driveImporting === f.id ? "Importing…" : f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : ""}
+                        </div>
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <style>{`
