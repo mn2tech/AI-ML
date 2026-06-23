@@ -10,18 +10,30 @@ const COOKIE_OPTS = {
   path: "/",
 };
 
+/** Vercel preview deploy hosts look like: docmind-xxx-team-projects.vercel.app */
+function isDeploymentPreviewHost(host) {
+  return /-[a-z0-9]+-projects\.vercel\.app$/i.test(host || "");
+}
+
 /** Resolve app base URL for OAuth redirect (Vercel, env, or localhost) */
 export function getBaseUrl(req) {
+  // 1. Explicit env (recommended for Vercel production)
   if (process.env.NEXT_PUBLIC_APP_URL) {
     return process.env.NEXT_PUBLIC_APP_URL.replace(/\/$/, "");
   }
-  if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL}`;
+  // 2. Vercel stable production domain (not per-deploy preview URL)
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) {
+    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
   }
-  const host = req?.headers?.host;
-  if (host) {
+  // 3. Host the user actually visited (skip deployment preview hosts)
+  const host = req?.headers?.["x-forwarded-host"]?.split(",")[0]?.trim() || req?.headers?.host;
+  if (host && !isDeploymentPreviewHost(host)) {
     const proto = host.includes("localhost") ? "http" : "https";
     return `${proto}://${host}`;
+  }
+  // 4. Fallback — may be a preview deploy URL (add to Google Console if needed)
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL}`;
   }
   return "http://localhost:3000";
 }
