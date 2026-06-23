@@ -134,6 +134,8 @@ export default function Home() {
   const [driveFiles, setDriveFiles] = useState([]);
   const [driveLoading, setDriveLoading] = useState(false);
   const [driveImporting, setDriveImporting] = useState(null);
+  const [driveSelected, setDriveSelected] = useState(new Set());
+  const [bulkProgress, setBulkProgress] = useState(null); // { done, total, current }
   const bottomRef = useRef(null);
   const router = useRouter();
   const inputRef = useRef(null);
@@ -367,6 +369,8 @@ export default function Home() {
     setDriveModal(true);
     setDriveLoading(true);
     setDriveFiles([]);
+    setDriveSelected(new Set());
+    setBulkProgress(null);
     try {
       const res = await fetch("/api/drive/list");
       const data = await res.json();
@@ -377,6 +381,83 @@ export default function Home() {
       setMessages((m) => [...m, { role: "assistant", text: `Drive error: ${e.message}`, sources: [] }]);
     }
     setDriveLoading(false);
+  }
+
+  // Toggle a single file checkbox
+  function toggleDriveSelect(fileId) {
+    setDriveSelected((prev) => {
+      const next = new Set(prev);
+      next.has(fileId) ? next.delete(fileId) : next.add(fileId);
+      return next;
+    });
+  }
+
+  // Toggle select all / deselect all
+  function toggleSelectAll() {
+    const importable = driveFiles.filter((f) => !docs.find((d) => d.name === `gdrive-${f.name}`));
+    if (driveSelected.size === importable.length) {
+      setDriveSelected(new Set());
+    } else {
+      setDriveSelected(new Set(importable.map((f) => f.id)));
+    }
+  }
+
+  // Import all selected files with progress tracking
+  async function importSelectedDriveFiles() {
+    if (uploading || docBusy || driveImporting || driveSelected.size === 0) return;
+
+    const filesToImport = driveFiles.filter((f) => driveSelected.has(f.id));
+    setUploading(true);
+    setBulkProgress({ done: 0, total: filesToImport.length, current: filesToImport[0]?.name });
+
+    let currentChunks = [...chunks];
+    let currentDocs = [...docs];
+    const imported = [];
+    const failed = [];
+
+    for (let i = 0; i < filesToImport.length; i++) {
+      const file = filesToImport[i];
+      setDriveImporting(file.id);
+      setBulkProgress({ done: i, total: filesToImport.length, current: file.name });
+
+      try {
+        const res = await fetch("/api/drive/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId: file.id, name: file.name, mimeType: file.mimeType }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Import failed");
+
+        const docName = `gdrive-${data.name}`;
+        const result = await indexDocument(docName, data.text, data.type, data.size, currentChunks, currentDocs);
+        if (result) {
+          currentChunks = result.chunks;
+          currentDocs = result.docs;
+          imported.push(data.name);
+        }
+      } catch (e) {
+        failed.push(`${file.name}: ${e.message}`);
+      }
+    }
+
+    setChunks(currentChunks);
+    setDocs(currentDocs);
+    setDriveImporting(null);
+    setUploading(false);
+    setBulkProgress(null);
+    setDriveSelected(new Set());
+    setDriveModal(false);
+
+    if (imported.length > 0) {
+      setMessages((m) => [...m, {
+        role: "assistant",
+        text: `✅ Imported ${imported.length} file${imported.length > 1 ? "s" : ""} from Drive:\n${imported.map((n) => `• ${n}`).join("\n")}${failed.length > 0 ? `\n\n⚠️ ${failed.length} failed:\n${failed.join("\n")}` : ""}`,
+        sources: [],
+      }]);
+    } else {
+      setMessages((m) => [...m, { role: "assistant", text: `Drive import failed:\n${failed.join("\n")}`, sources: [] }]);
+    }
   }
 
   async function importDriveFile(file) {
@@ -1041,67 +1122,163 @@ export default function Home() {
         </div>
 
         {/* Google Drive file picker modal */}
-        {driveModal && (
-          <div
-            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 }}
-            onClick={() => !driveImporting && setDriveModal(false)}
-          >
+        {driveModal && (() => {
+          const alreadyImported = (f) => Boolean(docs.find((d) => d.name === `gdrive-${f.name}`));
+          const importableFiles = driveFiles.filter((f) => !alreadyImported(f));
+          const allSelected = importableFiles.length > 0 && driveSelected.size === importableFiles.length;
+          const isBusy = Boolean(driveImporting) || Boolean(bulkProgress);
+
+          return (
             <div
-              style={{ background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 12, width: "100%", maxWidth: 420, maxHeight: "70vh", display: "flex", flexDirection: "column" }}
-              onClick={(e) => e.stopPropagation()}
+              style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 }}
+              onClick={() => !isBusy && setDriveModal(false)}
             >
-              <div style={{ padding: "12px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "Syne, sans-serif" }}>Import from Google Drive</span>
-                <button
-                  type="button"
-                  onClick={() => setDriveModal(false)}
-                  style={{ background: "none", border: "none", color: t.muted, cursor: "pointer", fontSize: 16 }}
-                >✕</button>
-              </div>
-              <div style={{ flex: 1, overflowY: "auto", padding: 8 }}>
-                {driveLoading ? (
-                  <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>Loading files…</div>
-                ) : driveFiles.length === 0 ? (
-                  <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>No importable files found.</div>
-                ) : (
-                  driveFiles.map((f) => (
+              <div
+                style={{ background: t.surface, border: `0.5px solid ${t.border}`, borderRadius: 12, width: "100%", maxWidth: 460, maxHeight: "75vh", display: "flex", flexDirection: "column" }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Header */}
+                <div style={{ padding: "12px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "Syne, sans-serif" }}>Import from Google Drive</span>
+                  <button type="button" onClick={() => !isBusy && setDriveModal(false)} style={{ background: "none", border: "none", color: t.muted, cursor: isBusy ? "not-allowed" : "pointer", fontSize: 16 }}>✕</button>
+                </div>
+
+                {/* Progress bar — shown during bulk import */}
+                {bulkProgress && (
+                  <div style={{ padding: "8px 14px", borderBottom: `0.5px solid ${t.border}`, background: "rgba(124,110,247,0.08)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                      <span style={{ fontSize: 10, color: t.accent, fontFamily: "'DM Mono', monospace" }}>
+                        Importing {bulkProgress.done + 1} of {bulkProgress.total}…
+                      </span>
+                      <span style={{ fontSize: 10, color: t.muted, fontFamily: "'DM Mono', monospace" }}>
+                        {Math.round((bulkProgress.done / bulkProgress.total) * 100)}%
+                      </span>
+                    </div>
+                    <div style={{ height: 3, background: t.surface2, borderRadius: 99, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${(bulkProgress.done / bulkProgress.total) * 100}%`, background: t.accent, borderRadius: 99, transition: "width 0.3s ease" }} />
+                    </div>
+                    <div style={{ fontSize: 9, color: t.dim, marginTop: 3, fontFamily: "'DM Mono', monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {bulkProgress.current}
+                    </div>
+                  </div>
+                )}
+
+                {/* Select All toolbar */}
+                {!driveLoading && importableFiles.length > 0 && !bulkProgress && (
+                  <div style={{ padding: "6px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 10, color: t.muted, fontFamily: "'DM Mono', monospace" }}>
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                        disabled={isBusy}
+                        style={{ accentColor: t.accent, width: 13, height: 13 }}
+                      />
+                      {allSelected ? "Deselect all" : `Select all (${importableFiles.length})`}
+                    </label>
+                    {driveSelected.size > 0 && (
+                      <span style={{ fontSize: 10, color: t.accent, fontFamily: "'DM Mono', monospace" }}>
+                        {driveSelected.size} selected
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {/* File list */}
+                <div style={{ flex: 1, overflowY: "auto", padding: 8 }}>
+                  {driveLoading ? (
+                    <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>Loading files…</div>
+                  ) : driveFiles.length === 0 ? (
+                    <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>No importable files found.</div>
+                  ) : (
+                    driveFiles.map((f) => {
+                      const already = alreadyImported(f);
+                      const isSelected = driveSelected.has(f.id);
+                      const isThisImporting = driveImporting === f.id;
+                      return (
+                        <div
+                          key={f.id}
+                          onClick={() => !isBusy && !already && toggleDriveSelect(f.id)}
+                          style={{
+                            width: "100%",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: "8px 10px",
+                            marginBottom: 4,
+                            borderRadius: 8,
+                            background: isThisImporting ? "rgba(124,110,247,0.2)" : isSelected ? "rgba(124,110,247,0.1)" : t.surface2,
+                            border: `0.5px solid ${isSelected ? t.accent : t.border}`,
+                            cursor: isBusy || already ? "not-allowed" : "pointer",
+                            opacity: already ? 0.45 : 1,
+                            textAlign: "left",
+                            fontFamily: "'DM Mono', monospace",
+                            color: t.text,
+                            transition: "background 0.15s, border 0.15s",
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isSelected || already}
+                            onChange={() => !isBusy && !already && toggleDriveSelect(f.id)}
+                            disabled={isBusy || already}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ accentColor: t.accent, width: 13, height: 13, flexShrink: 0 }}
+                          />
+                          <span style={{ fontSize: 14 }}>
+                            {f.mimeType === "application/pdf" ? "📕" : f.mimeType?.includes("spreadsheet") ? "📊" : f.mimeType?.includes("document") ? "📝" : "📄"}
+                          </span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                            <div style={{ fontSize: 9, color: t.dim }}>
+                              {already ? "✓ Already imported" : isThisImporting ? "Importing…" : f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : ""}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* Footer — Import button */}
+                {!driveLoading && !bulkProgress && (
+                  <div style={{ padding: "10px 14px", borderTop: `0.5px solid ${t.border}`, display: "flex", gap: 8 }}>
                     <button
-                      key={f.id}
                       type="button"
-                      disabled={Boolean(driveImporting)}
-                      onClick={() => importDriveFile(f)}
+                      onClick={() => setDriveModal(false)}
+                      disabled={isBusy}
+                      style={{ flex: 1, padding: "8px 0", borderRadius: 8, background: t.surface2, border: `0.5px solid ${t.border}`, color: t.muted, fontSize: 11, cursor: isBusy ? "not-allowed" : "pointer", fontFamily: "'DM Mono', monospace" }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={importSelectedDriveFiles}
+                      disabled={isBusy || driveSelected.size === 0}
                       style={{
-                        width: "100%",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "8px 10px",
-                        marginBottom: 4,
+                        flex: 2,
+                        padding: "8px 0",
                         borderRadius: 8,
-                        background: driveImporting === f.id ? "rgba(124,110,247,0.2)" : t.surface2,
-                        border: `0.5px solid ${t.border}`,
-                        cursor: driveImporting ? "wait" : "pointer",
-                        textAlign: "left",
-                        fontFamily: "'DM Mono', monospace",
-                        color: t.text,
+                        background: driveSelected.size > 0 ? t.accent : t.surface2,
+                        border: "none",
+                        color: driveSelected.size > 0 ? "#fff" : t.dim,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        cursor: isBusy || driveSelected.size === 0 ? "not-allowed" : "pointer",
+                        fontFamily: "Syne, sans-serif",
+                        transition: "background 0.15s",
                       }}
                     >
-                      <span style={{ fontSize: 14 }}>
-                        {f.mimeType === "application/pdf" ? "📕" : f.mimeType?.includes("spreadsheet") ? "📊" : f.mimeType?.includes("document") ? "📝" : "📄"}
-                      </span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
-                        <div style={{ fontSize: 9, color: t.dim }}>
-                          {driveImporting === f.id ? "Importing…" : f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : ""}
-                        </div>
-                      </div>
+                      {driveSelected.size === 0
+                        ? "Select files to import"
+                        : `Import ${driveSelected.size} file${driveSelected.size > 1 ? "s" : ""}`}
                     </button>
-                  ))
+                  </div>
                 )}
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
 
       <style>{`
