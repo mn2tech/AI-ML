@@ -7,7 +7,8 @@ const EXPORT_MIME = {
   "application/vnd.google-apps.presentation": "text/plain",
 };
 
-function isImportable(file) {
+/** Whether we can extract searchable text from this Drive file */
+export function isImportable(file) {
   const { mimeType, name } = file;
   if (!mimeType && !name) return false;
   if (EXPORT_MIME[mimeType]) return true;
@@ -15,6 +16,26 @@ function isImportable(file) {
   if (mimeType?.startsWith("text/")) return true;
   if (mimeType === "application/json") return true;
   return false;
+}
+
+/** Human-readable label for unsupported file types */
+export function getUnsupportedLabel(file) {
+  const { mimeType, name } = file;
+  const lower = name?.toLowerCase() || "";
+
+  if (mimeType === "application/vnd.google-apps.folder") return "Folder";
+  if (mimeType?.startsWith("image/") || /\.(jpg|jpeg|png|gif|webp|svg)$/.test(lower)) return "Image";
+  if (mimeType?.startsWith("video/") || /\.(mp4|mov|avi|mkv)$/.test(lower)) return "Video";
+  if (mimeType?.startsWith("audio/") || /\.(mp3|wav|m4a)$/.test(lower)) return "Audio";
+  if (mimeType?.includes("wordprocessingml") || /\.(docx?|rtf)$/.test(lower)) return "Word doc";
+  if (mimeType?.includes("spreadsheetml") || /\.xlsx?$/.test(lower)) return "Excel";
+  if (mimeType?.includes("presentationml") || /\.pptx?$/.test(lower)) return "PowerPoint";
+  if (mimeType === "application/zip" || lower.endsWith(".zip")) return "ZIP";
+  if (mimeType === "application/vnd.google-apps.form") return "Google Form";
+  if (mimeType === "application/vnd.google-apps.drawing") return "Google Drawing";
+  if (mimeType === "application/vnd.google-apps.shortcut") return "Shortcut";
+  if (mimeType === "application/vnd.google-apps.map") return "Google Map";
+  return "Unsupported";
 }
 
 function typeFromName(name, mimeType) {
@@ -42,19 +63,28 @@ async function downloadBinary(drive, fileId) {
   return Buffer.concat(chunks);
 }
 
-/** List recent importable Drive files */
+/** List Drive files (all types) with importable flag — paginated */
 export async function listDriveFiles(auth, pageToken) {
   const drive = google.drive({ version: "v3", auth });
   const res = await drive.files.list({
     q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
     fields: "nextPageToken, files(id, name, mimeType, size, modifiedTime)",
-    pageSize: 40,
+    pageSize: 50,
     orderBy: "modifiedTime desc",
     pageToken: pageToken || undefined,
   });
 
+  const files = (res.data.files || []).map((f) => {
+    const importable = isImportable(f);
+    return {
+      ...f,
+      importable,
+      unsupportedLabel: importable ? null : getUnsupportedLabel(f),
+    };
+  });
+
   return {
-    files: (res.data.files || []).filter(isImportable),
+    files,
     nextPageToken: res.data.nextPageToken || null,
   };
 }
@@ -99,5 +129,8 @@ export function driveFileIcon(mimeType, name) {
   if (mimeType?.includes("spreadsheet")) return "📊";
   if (mimeType?.includes("document")) return "📝";
   if (mimeType?.includes("presentation")) return "📽️";
+  if (mimeType?.startsWith("image/")) return "🖼️";
+  if (mimeType?.startsWith("video/")) return "🎬";
+  if (mimeType?.includes("wordprocessingml")) return "📘";
   return "📄";
 }

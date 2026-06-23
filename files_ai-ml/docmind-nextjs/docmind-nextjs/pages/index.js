@@ -136,6 +136,8 @@ export default function Home() {
   const [driveImporting, setDriveImporting] = useState(null);
   const [driveSelected, setDriveSelected] = useState(new Set());
   const [bulkProgress, setBulkProgress] = useState(null); // { done, total, current }
+  const [driveNextPageToken, setDriveNextPageToken] = useState(null);
+  const [driveLoadingMore, setDriveLoadingMore] = useState(false);
   const bottomRef = useRef(null);
   const router = useRouter();
   const inputRef = useRef(null);
@@ -371,16 +373,33 @@ export default function Home() {
     setDriveFiles([]);
     setDriveSelected(new Set());
     setBulkProgress(null);
+    setDriveNextPageToken(null);
     try {
       const res = await fetch("/api/drive/list");
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to list files");
       setDriveFiles(data.files || []);
+      setDriveNextPageToken(data.nextPageToken || null);
     } catch (e) {
       setDriveModal(false);
       setMessages((m) => [...m, { role: "assistant", text: `Drive error: ${e.message}`, sources: [] }]);
     }
     setDriveLoading(false);
+  }
+
+  async function loadMoreDriveFiles() {
+    if (!driveNextPageToken || driveLoadingMore || bulkProgress) return;
+    setDriveLoadingMore(true);
+    try {
+      const res = await fetch(`/api/drive/list?pageToken=${encodeURIComponent(driveNextPageToken)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to load more files");
+      setDriveFiles((prev) => [...prev, ...(data.files || [])]);
+      setDriveNextPageToken(data.nextPageToken || null);
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", text: `Drive error: ${e.message}`, sources: [] }]);
+    }
+    setDriveLoadingMore(false);
   }
 
   // Toggle a single file checkbox
@@ -392,9 +411,9 @@ export default function Home() {
     });
   }
 
-  // Toggle select all / deselect all
+  // Toggle select all / deselect all (importable only)
   function toggleSelectAll() {
-    const importable = driveFiles.filter((f) => !docs.find((d) => d.name === `gdrive-${f.name}`));
+    const importable = driveFiles.filter((f) => f.importable && !docs.find((d) => d.name === `gdrive-${f.name}`));
     if (driveSelected.size === importable.length) {
       setDriveSelected(new Set());
     } else {
@@ -406,7 +425,7 @@ export default function Home() {
   async function importSelectedDriveFiles() {
     if (uploading || docBusy || driveImporting || driveSelected.size === 0) return;
 
-    const filesToImport = driveFiles.filter((f) => driveSelected.has(f.id));
+    const filesToImport = driveFiles.filter((f) => driveSelected.has(f.id) && f.importable);
     setUploading(true);
     setBulkProgress({ done: 0, total: filesToImport.length, current: filesToImport[0]?.name });
 
@@ -1124,9 +1143,21 @@ export default function Home() {
         {/* Google Drive file picker modal */}
         {driveModal && (() => {
           const alreadyImported = (f) => Boolean(docs.find((d) => d.name === `gdrive-${f.name}`));
-          const importableFiles = driveFiles.filter((f) => !alreadyImported(f));
+          const importableFiles = driveFiles.filter((f) => f.importable && !alreadyImported(f));
+          const unsupportedCount = driveFiles.filter((f) => !f.importable).length;
           const allSelected = importableFiles.length > 0 && driveSelected.size === importableFiles.length;
           const isBusy = Boolean(driveImporting) || Boolean(bulkProgress);
+
+          const driveIcon = (f) => {
+            if (f.mimeType === "application/pdf") return "📕";
+            if (f.mimeType?.includes("spreadsheet")) return "📊";
+            if (f.mimeType?.includes("document")) return "📝";
+            if (f.mimeType?.includes("presentation")) return "📽️";
+            if (f.mimeType?.startsWith("image/")) return "🖼️";
+            if (f.mimeType?.startsWith("video/")) return "🎬";
+            if (f.mimeType?.includes("wordprocessingml")) return "📘";
+            return "📄";
+          };
 
           return (
             <div
@@ -1139,7 +1170,14 @@ export default function Home() {
               >
                 {/* Header */}
                 <div style={{ padding: "12px 14px", borderBottom: `0.5px solid ${t.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "Syne, sans-serif" }}>Import from Google Drive</span>
+                  <div>
+                    <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "Syne, sans-serif" }}>Import from Google Drive</span>
+                    {!driveLoading && driveFiles.length > 0 && (
+                      <div style={{ fontSize: 9, color: t.dim, marginTop: 2, fontFamily: "'DM Mono', monospace" }}>
+                        {driveFiles.length} shown · {importableFiles.length} importable{unsupportedCount > 0 ? ` · ${unsupportedCount} unsupported` : ""}
+                      </div>
+                    )}
+                  </div>
                   <button type="button" onClick={() => !isBusy && setDriveModal(false)} style={{ background: "none", border: "none", color: t.muted, cursor: isBusy ? "not-allowed" : "pointer", fontSize: 16 }}>✕</button>
                 </div>
 
@@ -1189,16 +1227,18 @@ export default function Home() {
                   {driveLoading ? (
                     <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>Loading files…</div>
                   ) : driveFiles.length === 0 ? (
-                    <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>No importable files found.</div>
+                    <div style={{ padding: 20, textAlign: "center", color: t.muted, fontSize: 12 }}>No files found.</div>
                   ) : (
                     driveFiles.map((f) => {
                       const already = alreadyImported(f);
+                      const unsupported = !f.importable;
                       const isSelected = driveSelected.has(f.id);
                       const isThisImporting = driveImporting === f.id;
+                      const rowDisabled = isBusy || already || unsupported;
                       return (
                         <div
                           key={f.id}
-                          onClick={() => !isBusy && !already && toggleDriveSelect(f.id)}
+                          onClick={() => !rowDisabled && toggleDriveSelect(f.id)}
                           style={{
                             width: "100%",
                             display: "flex",
@@ -1208,9 +1248,9 @@ export default function Home() {
                             marginBottom: 4,
                             borderRadius: 8,
                             background: isThisImporting ? "rgba(124,110,247,0.2)" : isSelected ? "rgba(124,110,247,0.1)" : t.surface2,
-                            border: `0.5px solid ${isSelected ? t.accent : t.border}`,
-                            cursor: isBusy || already ? "not-allowed" : "pointer",
-                            opacity: already ? 0.45 : 1,
+                            border: `0.5px solid ${isSelected ? t.accent : unsupported ? "rgba(248,113,113,0.25)" : t.border}`,
+                            cursor: rowDisabled ? "not-allowed" : "pointer",
+                            opacity: already || unsupported ? 0.5 : 1,
                             textAlign: "left",
                             fontFamily: "'DM Mono', monospace",
                             color: t.text,
@@ -1220,23 +1260,50 @@ export default function Home() {
                           <input
                             type="checkbox"
                             checked={isSelected || already}
-                            onChange={() => !isBusy && !already && toggleDriveSelect(f.id)}
-                            disabled={isBusy || already}
+                            onChange={() => !rowDisabled && toggleDriveSelect(f.id)}
+                            disabled={rowDisabled}
                             onClick={(e) => e.stopPropagation()}
                             style={{ accentColor: t.accent, width: 13, height: 13, flexShrink: 0 }}
                           />
-                          <span style={{ fontSize: 14 }}>
-                            {f.mimeType === "application/pdf" ? "📕" : f.mimeType?.includes("spreadsheet") ? "📊" : f.mimeType?.includes("document") ? "📝" : "📄"}
-                          </span>
+                          <span style={{ fontSize: 14 }}>{driveIcon(f)}</span>
                           <div style={{ flex: 1, minWidth: 0 }}>
                             <div style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
-                            <div style={{ fontSize: 9, color: t.dim }}>
-                              {already ? "✓ Already imported" : isThisImporting ? "Importing…" : f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : ""}
+                            <div style={{ fontSize: 9, color: unsupported ? "#f87171" : t.dim }}>
+                              {already
+                                ? "✓ Already imported"
+                                : unsupported
+                                  ? `⊘ ${f.unsupportedLabel || "Unsupported"}`
+                                  : isThisImporting
+                                    ? "Importing…"
+                                    : f.modifiedTime
+                                      ? new Date(f.modifiedTime).toLocaleDateString()
+                                      : ""}
                             </div>
                           </div>
                         </div>
                       );
                     })
+                  )}
+                  {driveNextPageToken && !bulkProgress && (
+                    <button
+                      type="button"
+                      onClick={loadMoreDriveFiles}
+                      disabled={driveLoadingMore || isBusy}
+                      style={{
+                        width: "100%",
+                        marginTop: 6,
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        background: t.surface2,
+                        border: `0.5px solid ${t.border}`,
+                        color: t.accentLight,
+                        fontSize: 10,
+                        cursor: driveLoadingMore ? "wait" : "pointer",
+                        fontFamily: "'DM Mono', monospace",
+                      }}
+                    >
+                      {driveLoadingMore ? "Loading more…" : "Load more files"}
+                    </button>
                   )}
                 </div>
 
