@@ -50,15 +50,13 @@ export default async function handler(req, res) {
     if (body.base64) {
       const pdfBuffer = Buffer.from(body.base64, "base64");
       const text = await extractPdfText(pdfBuffer);
-      if (!text) {
-        return res.status(422).json({ error: "Could not extract text from PDF." });
-      }
       return res.json({ text });
     }
 
     return res.status(400).json({ error: "Expected PDF file upload" });
   } catch (err) {
     console.error("PDF parse error:", err);
-    res.status(500).json({ error: err.message || "PDF parsing failed" });
+    const msg = err.message || "PDF parsing failed";
+    res.status(err.message?.includes("scanned") || err.message?.includes("image-only") ? 422 : 500).json({ error: msg });
   }
 }
